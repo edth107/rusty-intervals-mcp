@@ -35,6 +35,10 @@ def fix_schema(obj):
 
 KEY_DURATIONS = [1, 5, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600]
 
+WELLNESS_FITNESS_KEYS = {"id", "ctl", "ctlLoad", "atl", "atlLoad", "rampRate",
+                         "sportInfo", "hrv", "restingHR", "sleepScore", "sleepSecs",
+                         "sleepQuality", "weight", "bodyFat", "vo2max", "steps"}
+
 def compact_power_curves(data):
     """Transform power curves into LLM-friendly format."""
     if not isinstance(data, dict) or "value" not in data:
@@ -42,13 +46,13 @@ def compact_power_curves(data):
     val = data["value"]
     if not isinstance(val, dict) or "list" not in val:
         return None
-    
+
     result = {"curves": []}
     for curve in val.get("list", []):
         secs = curve.get("secs", [])
         watts = curve.get("watts", [])
         wkg = curve.get("watts_per_kg", [])
-        
+
         points = {}
         for i, s in enumerate(secs):
             if s in KEY_DURATIONS and i < len(watts):
@@ -56,7 +60,7 @@ def compact_power_curves(data):
                     "watts": watts[i],
                     "w_kg": round(wkg[i], 2) if i < len(wkg) else None
                 }
-        
+
         entry = {
             "label": curve.get("label", ""),
             "key_powers": points,
@@ -70,7 +74,7 @@ def compact_power_curves(data):
         if curve.get("vo2max_5m"):
             entry["vo2max"] = round(curve["vo2max_5m"], 1)
         result["curves"].append(entry)
-    
+
     result["activities_count"] = len(val.get("activities", {}))
     return result
 
@@ -80,7 +84,7 @@ def compact_streams(data):
         return None
     if not data or not isinstance(data[0], dict) or "type" not in data[0]:
         return None
-    
+
     result = {}
     for stream in data:
         stype = stream.get("type", "unknown")
@@ -104,13 +108,46 @@ def compact_streams(data):
         }
     return result
 
-def compact_fitness(data):
-    """Fix empty fitness summary - extract from value if nested."""
-    if isinstance(data, dict) and "value" in data:
-        val = data["value"]
-        if isinstance(val, dict) and not val:
-            return None  # truly empty, leave as-is
-    return None
+def compact_wellness(data):
+    """Compact wellness array: strip nulls, keep only fitness-relevant keys."""
+    if not isinstance(data, list):
+        return None
+    if not data or not isinstance(data[0], dict) or "ctl" not in data[0]:
+        return None
+
+    days = []
+    for day in data:
+        compact_day = {}
+        for k in WELLNESS_FITNESS_KEYS:
+            v = day.get(k)
+            if v is not None:
+                compact_day[k] = v
+        if compact_day:
+            days.append(compact_day)
+
+    if not days:
+        return None
+
+    # Add trend summary from first and last day
+    first = days[0]
+    last = days[-1]
+    summary = {
+        "period": f"{first.get('id', '?')} to {last.get('id', '?')}",
+        "days": len(days),
+    }
+    if "ctl" in first and "ctl" in last:
+        summary["ctl_trend"] = f"{round(first['ctl'], 1)} → {round(last['ctl'], 1)}"
+    if "atl" in first and "atl" in last:
+        summary["atl_trend"] = f"{round(first['atl'], 1)} → {round(last['atl'], 1)}"
+    if "ctl" in last and "atl" in last:
+        summary["tsb_current"] = round(last["ctl"] - last["atl"], 1)
+    if "rampRate" in last:
+        summary["ramp_rate"] = round(last["rampRate"], 2)
+    if last.get("sportInfo"):
+        si = last["sportInfo"][0]
+        summary["eftp"] = round(si.get("eftp", 0), 1)
+
+    return {"summary": summary}
 
 def transform_payload(payload):
     """Try to compact known response shapes. Returns None if no transform needed."""
@@ -118,32 +155,38 @@ def transform_payload(payload):
     r = compact_power_curves(payload)
     if r:
         return r
-    
+
     # Streams: [{"type": "power", "data": [...]}, ...]
     if isinstance(payload, list):
         r = compact_streams(payload)
         if r:
             return r
-    
-    # Wrapped streams: {"value": [...]}
+        r = compact_wellness(payload)
+        if r:
+            return r
+
+    # Wrapped in {"value": [...]}
     if isinstance(payload, dict) and "value" in payload and isinstance(payload["value"], list):
         r = compact_streams(payload["value"])
         if r:
             return r
-    
+        r = compact_wellness(payload["value"])
+        if r:
+            return r
+
     return None
 
 for line in proc.stdout:
     try:
         msg = json.loads(line)
-        
+
         # Fix tool schemas in tools/list
         if "result" in msg and "tools" in msg.get("result", {}):
             for tool in msg["result"]["tools"]:
                 tool.pop("outputSchema", None)
                 if "inputSchema" in tool:
                     fix_schema(tool["inputSchema"])
-        
+
         # Transform tool call content responses
         elif "result" in msg and "content" in msg.get("result", {}):
             content = msg["result"]["content"]
@@ -156,12 +199,11 @@ for line in proc.stdout:
                             if transformed:
                                 new_text = json.dumps(transformed)
                                 item["text"] = new_text
-                                # Also update structuredContent
                                 if "structuredContent" in msg["result"]:
                                     msg["result"]["structuredContent"] = transformed
                         except (json.JSONDecodeError, KeyError):
                             pass
-        
+
         sys.stdout.write(json.dumps(msg) + "\n")
         sys.stdout.flush()
     except (json.JSONDecodeError, KeyError):

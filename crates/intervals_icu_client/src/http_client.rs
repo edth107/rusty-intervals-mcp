@@ -858,7 +858,7 @@ impl IntervalsClient for ReqwestIntervalsClient {
     }
 
     async fn get_fitness_summary(&self) -> Result<serde_json::Value, IntervalsError> {
-        let url = format!("{}/api/v1/athlete/{}", self.base_url, self.athlete_id);
+        let url = format!("{}/api/v1/athlete/{}/wellness", self.base_url, self.athlete_id);
         self.execute_json(self.get_request(&url)).await
     }
 

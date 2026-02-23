@@ -548,7 +548,7 @@ impl IntervalsMcpHandler {
         // Apply compact transformations
         let result = Self::transform_intervals(
             &v,
-            p.summary.unwrap_or(true),
+            p.summary.unwrap_or(false),
             p.max_intervals.unwrap_or(20) as usize,
             p.fields.as_deref(),
         );
@@ -581,7 +581,7 @@ impl IntervalsMcpHandler {
             return Err("Must provide either 'duration' (seconds) or 'distance' (meters) for best efforts analysis".to_string());
         }
 
-        let summary_mode = p.summary.unwrap_or(true);
+        let summary_mode = p.summary.unwrap_or(false);
         let options = intervals_icu_client::BestEffortsOptions {
             stream: Some(p.stream.clone()),
             duration: p.duration,
@@ -1114,7 +1114,7 @@ impl IntervalsMcpHandler {
             .map_err(|e| e.to_string())?;
 
         // Apply compact mode
-        let result = Self::transform_wellness(&v, p.summary.unwrap_or(true), p.fields.as_deref());
+        let result = Self::transform_wellness(&v, p.summary.unwrap_or(false), p.fields.as_deref());
         Ok(Json(ObjectResult { value: result }))
     }
 
