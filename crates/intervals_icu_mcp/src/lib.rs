@@ -501,7 +501,7 @@ impl IntervalsMcpHandler {
         // Apply compact transformations
         let result = Self::transform_intervals(
             &v,
-            p.summary.unwrap_or(true),
+            p.summary.unwrap_or(false),
             p.max_intervals.unwrap_or(20) as usize,
             p.fields.as_deref(),
         );
@@ -534,7 +534,7 @@ impl IntervalsMcpHandler {
             return Err("Must provide either 'duration' (seconds) or 'distance' (meters) for best efforts analysis".to_string());
         }
 
-        let summary_mode = p.summary.unwrap_or(true);
+        let summary_mode = p.summary.unwrap_or(false);
         let options = intervals_icu_client::BestEffortsOptions {
             stream: Some(p.stream.clone()),
             duration: p.duration,
@@ -629,7 +629,7 @@ impl IntervalsMcpHandler {
             .map_err(|e| e.to_string())?;
 
         // Apply compact mode
-        let result = Self::transform_curves(&v, p.summary.unwrap_or(true), p.durations.as_deref());
+        let result = Self::transform_curves(&v, p.summary.unwrap_or(false), p.durations.as_deref());
         Ok(Json(ObjectResult { value: result }))
     }
 
@@ -658,7 +658,7 @@ impl IntervalsMcpHandler {
             .map_err(|e| e.to_string())?;
 
         let result =
-            Self::transform_histogram(&v, p.summary.unwrap_or(true), p.bins.unwrap_or(10) as usize);
+            Self::transform_histogram(&v, p.summary.unwrap_or(false), p.bins.unwrap_or(10) as usize);
         Ok(Json(ObjectResult { value: result }))
     }
 
@@ -945,7 +945,7 @@ impl IntervalsMcpHandler {
             .map_err(|e| e.to_string())?;
 
         let result =
-            Self::transform_histogram(&v, p.summary.unwrap_or(true), p.bins.unwrap_or(10) as usize);
+            Self::transform_histogram(&v, p.summary.unwrap_or(false), p.bins.unwrap_or(10) as usize);
         Ok(Json(ObjectResult { value: result }))
     }
 
@@ -965,7 +965,7 @@ impl IntervalsMcpHandler {
             .map_err(|e| e.to_string())?;
 
         let result =
-            Self::transform_histogram(&v, p.summary.unwrap_or(true), p.bins.unwrap_or(10) as usize);
+            Self::transform_histogram(&v, p.summary.unwrap_or(false), p.bins.unwrap_or(10) as usize);
         Ok(Json(ObjectResult { value: result }))
     }
 
@@ -985,7 +985,7 @@ impl IntervalsMcpHandler {
             .map_err(|e| e.to_string())?;
 
         let result =
-            Self::transform_histogram(&v, p.summary.unwrap_or(true), p.bins.unwrap_or(10) as usize);
+            Self::transform_histogram(&v, p.summary.unwrap_or(false), p.bins.unwrap_or(10) as usize);
         Ok(Json(ObjectResult { value: result }))
     }
 
@@ -1058,7 +1058,7 @@ impl IntervalsMcpHandler {
         // Apply wellness transformation
         let result = domains::wellness::transform_wellness(
             &v,
-            p.summary.unwrap_or(true),
+            p.summary.unwrap_or(false),
             p.fields.as_deref(),
         );
         Ok(Json(ObjectResult { value: result }))
@@ -1326,7 +1326,7 @@ impl IntervalsMcpHandler {
             .await
             .map_err(|e| e.to_string())?;
 
-        let result = Self::transform_curves(&v, p.summary.unwrap_or(true), p.durations.as_deref());
+        let result = Self::transform_curves(&v, p.summary.unwrap_or(false), p.durations.as_deref());
         Ok(Json(ObjectResult { value: result }))
     }
 
@@ -1345,7 +1345,7 @@ impl IntervalsMcpHandler {
             .await
             .map_err(|e| e.to_string())?;
 
-        let result = Self::transform_curves(&v, p.summary.unwrap_or(true), p.durations.as_deref());
+        let result = Self::transform_curves(&v, p.summary.unwrap_or(false), p.durations.as_deref());
         Ok(Json(ObjectResult { value: result }))
     }
 
