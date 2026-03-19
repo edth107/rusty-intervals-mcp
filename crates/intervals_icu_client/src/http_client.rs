@@ -734,15 +734,19 @@ impl IntervalsClient for ReqwestIntervalsClient {
         &self,
         days_back: Option<i32>,
         sport: &str,
+        date_range: Option<&str>,
     ) -> Result<serde_json::Value, IntervalsError> {
         let url = format!(
             "{}/api/v1/athlete/{}/power-curves",
             self.base_url, self.athlete_id
         );
         let mut pairs: Vec<(&str, String)> = vec![("type", Self::normalize_sport(sport))];
-        if let Some(d) = days_back {
+        if let Some(range) = date_range {
+            pairs.push(("curves", format!("r.{}", range)));
+        } else if let Some(d) = days_back {
             pairs.push(("curves", format!("{}d", d)));
         }
+
         let qp: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
         self.execute_json(self.get_request(&url).query(&qp)).await
     }

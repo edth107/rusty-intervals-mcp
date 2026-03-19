@@ -624,7 +624,7 @@ impl IntervalsMcpHandler {
         let p = params.0;
         let v = self
             .client
-            .get_power_curves(p.days_back, &p.sport)
+            .get_power_curves(p.days_back, &p.sport, p.date_range.as_deref())
             .await
             .map_err(|e| e.to_string())?;
 

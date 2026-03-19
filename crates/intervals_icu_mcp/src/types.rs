@@ -229,6 +229,8 @@ pub struct CurvesParams {
     pub durations: Option<Vec<u32>>,
     /// Return summary with key durations only (default: true)
     pub summary: Option<bool>,
+    /// Date range for historical curves (format: "YYYY-MM-DD.YYYY-MM-DD")
+    pub date_range: Option<String>,
 }
 
 /// Parameters for get_workouts_in_folder with compact mode

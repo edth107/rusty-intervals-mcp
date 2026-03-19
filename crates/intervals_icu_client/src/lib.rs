@@ -229,6 +229,7 @@ pub trait IntervalsClient: Send + Sync + 'static {
         &self,
         days_back: Option<i32>,
         sport: &str,
+        date_range: Option<&str>,
     ) -> Result<serde_json::Value, IntervalsError>;
     async fn get_gap_histogram(
         &self,

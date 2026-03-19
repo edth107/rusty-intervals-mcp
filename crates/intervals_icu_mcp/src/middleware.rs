@@ -314,9 +314,10 @@ impl<C: IntervalsClient + 'static> IntervalsClient for LoggingMiddleware<C> {
         &self,
         days_back: Option<i32>,
         sport: &str,
+        date_range: Option<&str>,
     ) -> Result<serde_json::Value, IntervalsError> {
         self.with_logging(
-            |client| async move { client.get_power_curves(days_back, sport).await },
+            |client| async move { client.get_power_curves(days_back, sport, date_range).await },
             "get_power_curves",
         )
         .await
