@@ -16,22 +16,52 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
+const KEY_DURATIONS: &[u32] = &[1, 5, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600];
+
 pub fn transform_streams(
     value: Value,
     max_points: Option<u32>,
     summary_only: bool,
     filter_streams: Option<Vec<String>>,
 ) -> Value {
-    let Some(obj) = value.as_object() else {
-        return value;
-    };
+    match value {
+        Value::Array(streams) if is_stream_list(&streams) => {
+            return transform_stream_list(
+                streams,
+                max_points,
+                summary_only,
+                filter_streams.as_deref(),
+            );
+        }
+        Value::Object(mut obj) => {
+            if let Some(streams) = obj.remove("streams") {
+                let transformed =
+                    transform_streams(streams, max_points, summary_only, filter_streams);
+                obj.insert("streams".to_string(), transformed);
+                return Value::Object(obj);
+            }
 
+            return transform_stream_object(
+                obj,
+                max_points,
+                summary_only,
+                filter_streams.as_deref(),
+            );
+        }
+        other => return other,
+    }
+}
+
+fn transform_stream_object(
+    obj: Map<String, Value>,
+    max_points: Option<u32>,
+    summary_only: bool,
+    filter_streams: Option<&[String]>,
+) -> Value {
     let mut result = Map::new();
 
     for (key, val) in obj {
-        if let Some(ref filter) = filter_streams
-            && !filter.iter().any(|f| f.eq_ignore_ascii_case(key))
-        {
+        if !stream_matches_filter(&key, filter_streams) {
             continue;
         }
 
@@ -53,6 +83,60 @@ pub fn transform_streams(
     }
 
     Value::Object(result)
+}
+
+fn transform_stream_list(
+    streams: Vec<Value>,
+    max_points: Option<u32>,
+    summary_only: bool,
+    filter_streams: Option<&[String]>,
+) -> Value {
+    let mut result = Map::new();
+
+    for stream in streams {
+        let Some(obj) = stream.as_object() else {
+            continue;
+        };
+        let stream_type = obj
+            .get("type")
+            .or_else(|| obj.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+
+        if !stream_matches_filter(stream_type, filter_streams) {
+            continue;
+        }
+
+        let Some(data) = obj.get("data").and_then(Value::as_array) else {
+            continue;
+        };
+
+        let value = if summary_only {
+            compute_stream_stats(data)
+        } else if let Some(max) = max_points {
+            Value::Array(downsample_array(data, max as usize))
+        } else {
+            Value::Array(data.clone())
+        };
+        result.insert(stream_type.to_string(), value);
+    }
+
+    Value::Object(result)
+}
+
+fn is_stream_list(streams: &[Value]) -> bool {
+    streams
+        .first()
+        .and_then(Value::as_object)
+        .is_some_and(|obj| {
+            obj.contains_key("data") && (obj.contains_key("type") || obj.contains_key("name"))
+        })
+}
+
+fn stream_matches_filter(stream_type: &str, filter_streams: Option<&[String]>) -> bool {
+    filter_streams
+        .map(|filter| filter.iter().any(|f| f.eq_ignore_ascii_case(stream_type)))
+        .unwrap_or(true)
 }
 
 pub fn compute_stream_stats(arr: &[Value]) -> Value {
@@ -247,9 +331,19 @@ pub fn summarize_best_efforts(value: &Value, stream: &str) -> Value {
 }
 
 pub fn transform_curves(value: &Value, summary_only: bool, durations: Option<&[u32]>) -> Value {
+    if summary_only
+        && let Some(compact) = compact_curve_payload(value, durations.unwrap_or(KEY_DURATIONS))
+    {
+        return compact;
+    }
+
     if let Some(dur_filter) = durations
         && let Some(obj) = value.as_object()
     {
+        if obj.get("list").and_then(Value::as_array).is_some() {
+            return filter_curve_payload(value, dur_filter).unwrap_or_else(|| value.clone());
+        }
+
         let mut result = Map::new();
         for (key, val) in obj {
             if let Some(arr) = val.as_array() {
@@ -274,7 +368,6 @@ pub fn transform_curves(value: &Value, summary_only: bool, durations: Option<&[u
     }
 
     if summary_only {
-        let key_durations = [5, 30, 60, 300, 1200, 3600];
         if let Some(obj) = value.as_object() {
             let mut result = Map::new();
             for (key, val) in obj {
@@ -284,7 +377,7 @@ pub fn transform_curves(value: &Value, summary_only: bool, durations: Option<&[u
                         .filter(|item| {
                             item.get("secs")
                                 .and_then(|s| s.as_u64())
-                                .map(|s| key_durations.contains(&(s as u32)))
+                                .map(|s| KEY_DURATIONS.contains(&(s as u32)))
                                 .unwrap_or(false)
                         })
                         .collect();
@@ -303,6 +396,132 @@ pub fn transform_curves(value: &Value, summary_only: bool, durations: Option<&[u
     value.clone()
 }
 
+fn compact_curve_payload(value: &Value, durations: &[u32]) -> Option<Value> {
+    let payload = if value.get("list").is_some() {
+        value
+    } else {
+        value.get("value")?
+    };
+    let list = payload.get("list")?.as_array()?;
+
+    let mut curves = Vec::new();
+    for curve in list {
+        let secs = curve.get("secs").and_then(Value::as_array)?;
+        let watts = curve.get("watts").and_then(Value::as_array)?;
+        let watts_per_kg = curve.get("watts_per_kg").and_then(Value::as_array);
+
+        let mut key_powers = Map::new();
+        for (idx, sec) in secs.iter().enumerate() {
+            let Some(sec) = sec.as_u64().map(|s| s as u32) else {
+                continue;
+            };
+            if !durations.contains(&sec) || idx >= watts.len() {
+                continue;
+            }
+
+            let mut point = Map::new();
+            point.insert("watts".to_string(), watts[idx].clone());
+            if let Some(wkg) = watts_per_kg
+                .and_then(|arr| arr.get(idx))
+                .and_then(Value::as_f64)
+            {
+                point.insert("w_kg".to_string(), Value::from(round_to(wkg, 2)));
+            } else {
+                point.insert("w_kg".to_string(), Value::Null);
+            }
+            key_powers.insert(format!("{}s", sec), Value::Object(point));
+        }
+
+        let mut entry = Map::new();
+        entry.insert(
+            "label".to_string(),
+            curve
+                .get("label")
+                .cloned()
+                .unwrap_or_else(|| Value::String(String::new())),
+        );
+        entry.insert("key_powers".to_string(), Value::Object(key_powers));
+        entry.insert(
+            "weight".to_string(),
+            curve.get("weight").cloned().unwrap_or(Value::Null),
+        );
+
+        if let Some(models) = curve.get("powerModels").and_then(Value::as_array) {
+            let ftp_estimates = models
+                .iter()
+                .map(|model| {
+                    serde_json::json!({
+                        "model": model.get("type").cloned().unwrap_or(Value::Null),
+                        "ftp": model.get("ftp").cloned().unwrap_or(Value::Null),
+                        "w_prime": model.get("wPrime").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect();
+            entry.insert("ftp_estimates".to_string(), Value::Array(ftp_estimates));
+        }
+
+        if let Some(vo2max) = curve.get("vo2max_5m").and_then(Value::as_f64) {
+            entry.insert("vo2max".to_string(), Value::from(round_to(vo2max, 1)));
+        }
+
+        curves.push(Value::Object(entry));
+    }
+
+    let activities_count = payload
+        .get("activities")
+        .and_then(Value::as_object)
+        .map(|activities| activities.len())
+        .unwrap_or(0);
+
+    Some(serde_json::json!({
+        "curves": curves,
+        "activities_count": activities_count
+    }))
+}
+
+fn filter_curve_payload(value: &Value, durations: &[u32]) -> Option<Value> {
+    let payload = value.as_object()?;
+    let list = payload.get("list")?.as_array()?;
+    let mut filtered_payload = payload.clone();
+
+    let filtered_list = list
+        .iter()
+        .map(|curve| {
+            let Some(curve_obj) = curve.as_object() else {
+                return curve.clone();
+            };
+            let Some(secs) = curve_obj.get("secs").and_then(Value::as_array) else {
+                return curve.clone();
+            };
+
+            let keep_indexes: Vec<usize> = secs
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, sec)| {
+                    sec.as_u64()
+                        .filter(|sec| durations.contains(&(*sec as u32)))
+                        .map(|_| idx)
+                })
+                .collect();
+
+            let mut filtered_curve = curve_obj.clone();
+            for key in ["secs", "watts", "watts_per_kg"] {
+                if let Some(arr) = curve_obj.get(key).and_then(Value::as_array) {
+                    let filtered_values = keep_indexes
+                        .iter()
+                        .filter_map(|idx| arr.get(*idx).cloned())
+                        .collect();
+                    filtered_curve.insert(key.to_string(), Value::Array(filtered_values));
+                }
+            }
+            Value::Object(filtered_curve)
+        })
+        .collect();
+
+    filtered_payload.insert("list".to_string(), Value::Array(filtered_list));
+    Some(Value::Object(filtered_payload))
+}
+
 pub fn transform_histogram(value: &Value, summary_only: bool, max_bins: usize) -> Value {
     if summary_only && let Some(arr) = value.as_array() {
         let mut total_count: f64 = 0.0;
@@ -311,14 +530,34 @@ pub fn transform_histogram(value: &Value, summary_only: bool, max_bins: usize) -
         let mut max_val: Option<f64> = None;
 
         for item in arr {
-            let value = item.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let count = item.get("count").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let count = item
+                .get("count")
+                .or_else(|| item.get("secs"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let value = item
+                .get("value")
+                .and_then(|v| v.as_f64())
+                .or_else(|| {
+                    match (
+                        item.get("min").and_then(Value::as_f64),
+                        item.get("max").and_then(Value::as_f64),
+                    ) {
+                        (Some(min), Some(max)) => Some((min + max) / 2.0),
+                        (Some(min), None) => Some(min),
+                        (None, Some(max)) => Some(max),
+                        _ => None,
+                    }
+                })
+                .unwrap_or(0.0);
 
             if count > 0.0 {
                 total_count += count;
                 weighted_sum += value * count;
-                min_val = Some(min_val.map_or(value, |m: f64| m.min(value)));
-                max_val = Some(max_val.map_or(value, |m: f64| m.max(value)));
+                let bucket_min = item.get("min").and_then(Value::as_f64).unwrap_or(value);
+                let bucket_max = item.get("max").and_then(Value::as_f64).unwrap_or(value);
+                min_val = Some(min_val.map_or(bucket_min, |m: f64| m.min(bucket_min)));
+                max_val = Some(max_val.map_or(bucket_max, |m: f64| m.max(bucket_max)));
             }
         }
 
@@ -345,6 +584,11 @@ pub fn transform_histogram(value: &Value, summary_only: bool, max_bins: usize) -
     }
 
     value.clone()
+}
+
+fn round_to(value: f64, decimals: u32) -> f64 {
+    let factor = 10_f64.powi(decimals as i32);
+    (value * factor).round() / factor
 }
 
 #[cfg(test)]
@@ -423,6 +667,69 @@ mod tests {
         assert_eq!(stats["min"], 1.0);
         assert_eq!(stats["max"], 3.0);
         assert_eq!(stats["avg"], 2.0);
+    }
+
+    #[test]
+    fn transform_streams_compacts_intervals_stream_array_shape() {
+        let input = serde_json::json!([
+            {"type": "time", "data": [0, 1, 2, 3]},
+            {"type": "watts", "data": [100, 150, 200, null]},
+            {"type": "cadence", "data": [80, 90, 100]}
+        ]);
+
+        let result = transform_streams(input, None, true, Some(vec!["watts".into()]));
+        assert!(result.get("time").is_none());
+        assert!(result.get("cadence").is_none());
+        assert_eq!(result["watts"]["count"], 3);
+        assert_eq!(result["watts"]["avg"], 150.0);
+        assert_eq!(result["watts"]["p50"], 150.0);
+    }
+
+    #[test]
+    fn transform_streams_downsamples_intervals_stream_array_shape() {
+        let input = serde_json::json!([
+            {"type": "watts", "data": [1, 2, 3, 4, 5]}
+        ]);
+
+        let result = transform_streams(input, Some(3), false, None);
+        assert_eq!(result["watts"], serde_json::json!([1, 3, 5]));
+    }
+
+    #[test]
+    fn transform_curves_compacts_parallel_array_payload() {
+        let input = serde_json::json!({
+            "list": [{
+                "label": "42 days",
+                "secs": [1, 5, 60, 300],
+                "watts": [500, 450, 300, 250],
+                "watts_per_kg": [8.1, 7.2, 4.8, 4.0],
+                "weight": 62.0,
+                "powerModels": [{"type": "FFT", "ftp": 220, "wPrime": 12000}],
+                "vo2max_5m": 52.44
+            }],
+            "activities": {"a1": {}, "a2": {}}
+        });
+
+        let result = transform_curves(&input, true, None);
+        assert_eq!(result["activities_count"], 2);
+        assert_eq!(result["curves"][0]["key_powers"]["1s"]["watts"], 500);
+        assert_eq!(result["curves"][0]["key_powers"]["300s"]["w_kg"], 4.0);
+        assert_eq!(result["curves"][0]["ftp_estimates"][0]["w_prime"], 12000);
+        assert_eq!(result["curves"][0]["vo2max"], 52.4);
+    }
+
+    #[test]
+    fn transform_histogram_summary_understands_secs_bins() {
+        let input = serde_json::json!([
+            {"min": 0, "max": 99, "secs": 10},
+            {"min": 100, "max": 199, "secs": 20}
+        ]);
+
+        let result = transform_histogram(&input, true, 10);
+        assert_eq!(result["total_samples"], 30);
+        assert_eq!(result["min"], 0.0);
+        assert_eq!(result["max"], 199.0);
+        assert_eq!(result["weighted_avg"], 116.17);
     }
 
     #[test]

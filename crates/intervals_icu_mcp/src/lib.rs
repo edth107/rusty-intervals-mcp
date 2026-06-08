@@ -5,12 +5,13 @@ use tokio::sync::{Mutex, watch};
 use rmcp::Json;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    AnnotateAble, GetPromptRequestParams, GetPromptResult, ListPromptsResult, ListResourcesResult,
-    PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult, ResourceContents,
+    AnnotateAble, CallToolRequestParams, CallToolResult, GetPromptRequestParams, GetPromptResult,
+    ListPromptsResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+    ReadResourceRequestParams, ReadResourceResult, ResourceContents, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer};
-use rmcp::{prompt, prompt_handler, prompt_router, tool, tool_handler, tool_router};
+use rmcp::{prompt, prompt_handler, prompt_router, tool, tool_router};
 
 use intervals_icu_client::{ActivitySummary, IntervalsClient};
 
@@ -20,6 +21,7 @@ use crate::compact::{ToToolError, apply_compact_mode, apply_compact_mode_with_fi
 pub mod compact;
 pub mod domains;
 mod event_id;
+mod mcp_compat;
 pub mod middleware;
 pub mod prompts;
 mod services;
@@ -456,15 +458,16 @@ impl IntervalsMcpHandler {
         params: Parameters<StreamsParams>,
     ) -> Result<Json<ObjectResult>, String> {
         let p = params.0;
+        let stream_filter = p.streams.clone();
         let v = self
             .client
-            .get_activity_streams(&p.activity_id, None)
+            .get_activity_streams(&p.activity_id, stream_filter.clone())
             .await
             .map_err(|e| e.to_string())?;
 
         // Apply compact transformations if requested
         let result =
-            Self::transform_streams(v, p.max_points, p.summary.unwrap_or(false), p.streams);
+            Self::transform_streams(v, p.max_points, p.summary.unwrap_or(true), stream_filter);
         Ok(Json(ObjectResult { value: result }))
     }
 
@@ -629,7 +632,7 @@ impl IntervalsMcpHandler {
             .map_err(|e| e.to_string())?;
 
         // Apply compact mode
-        let result = Self::transform_curves(&v, p.summary.unwrap_or(false), p.durations.as_deref());
+        let result = Self::transform_curves(&v, p.summary.unwrap_or(true), p.durations.as_deref());
         Ok(Json(ObjectResult { value: result }))
     }
 
@@ -657,8 +660,11 @@ impl IntervalsMcpHandler {
             .await
             .map_err(|e| e.to_string())?;
 
-        let result =
-            Self::transform_histogram(&v, p.summary.unwrap_or(false), p.bins.unwrap_or(10) as usize);
+        let result = Self::transform_histogram(
+            &v,
+            p.summary.unwrap_or(false),
+            p.bins.unwrap_or(10) as usize,
+        );
         Ok(Json(ObjectResult { value: result }))
     }
 
@@ -944,8 +950,11 @@ impl IntervalsMcpHandler {
             .await
             .map_err(|e| e.to_string())?;
 
-        let result =
-            Self::transform_histogram(&v, p.summary.unwrap_or(false), p.bins.unwrap_or(10) as usize);
+        let result = Self::transform_histogram(
+            &v,
+            p.summary.unwrap_or(false),
+            p.bins.unwrap_or(10) as usize,
+        );
         Ok(Json(ObjectResult { value: result }))
     }
 
@@ -964,8 +973,11 @@ impl IntervalsMcpHandler {
             .await
             .map_err(|e| e.to_string())?;
 
-        let result =
-            Self::transform_histogram(&v, p.summary.unwrap_or(false), p.bins.unwrap_or(10) as usize);
+        let result = Self::transform_histogram(
+            &v,
+            p.summary.unwrap_or(false),
+            p.bins.unwrap_or(10) as usize,
+        );
         Ok(Json(ObjectResult { value: result }))
     }
 
@@ -984,8 +996,11 @@ impl IntervalsMcpHandler {
             .await
             .map_err(|e| e.to_string())?;
 
-        let result =
-            Self::transform_histogram(&v, p.summary.unwrap_or(false), p.bins.unwrap_or(10) as usize);
+        let result = Self::transform_histogram(
+            &v,
+            p.summary.unwrap_or(false),
+            p.bins.unwrap_or(10) as usize,
+        );
         Ok(Json(ObjectResult { value: result }))
     }
 
@@ -1058,7 +1073,7 @@ impl IntervalsMcpHandler {
         // Apply wellness transformation
         let result = domains::wellness::transform_wellness(
             &v,
-            p.summary.unwrap_or(false),
+            p.summary.unwrap_or(true),
             p.fields.as_deref(),
         );
         Ok(Json(ObjectResult { value: result }))
@@ -1326,7 +1341,7 @@ impl IntervalsMcpHandler {
             .await
             .map_err(|e| e.to_string())?;
 
-        let result = Self::transform_curves(&v, p.summary.unwrap_or(false), p.durations.as_deref());
+        let result = Self::transform_curves(&v, p.summary.unwrap_or(true), p.durations.as_deref());
         Ok(Json(ObjectResult { value: result }))
     }
 
@@ -1345,7 +1360,7 @@ impl IntervalsMcpHandler {
             .await
             .map_err(|e| e.to_string())?;
 
-        let result = Self::transform_curves(&v, p.summary.unwrap_or(false), p.durations.as_deref());
+        let result = Self::transform_curves(&v, p.summary.unwrap_or(true), p.durations.as_deref());
         Ok(Json(ObjectResult { value: result }))
     }
 
@@ -1899,7 +1914,6 @@ impl IntervalsMcpHandler {
     }
 }
 
-#[tool_handler]
 #[prompt_handler(router = self.prompt_router)]
 impl rmcp::ServerHandler for IntervalsMcpHandler {
     // === Server Info & Capabilities ===
@@ -1917,6 +1931,34 @@ impl rmcp::ServerHandler for IntervalsMcpHandler {
                 .build(),
             ..Default::default()
         }
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let context = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(context).await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        Ok(ListToolsResult {
+            tools: mcp_compat::sanitize_tools(self.tool_router.list_all()),
+            next_cursor: None,
+            meta: None,
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tool_router
+            .get(name)
+            .cloned()
+            .map(mcp_compat::sanitize_tool)
     }
 
     // === MCP Resource Implementation ===
@@ -2262,6 +2304,7 @@ mod tests {
                 &self,
                 _days_back: Option<i32>,
                 _sport: &str,
+                _date_range: Option<&str>,
             ) -> Result<serde_json::Value, intervals_icu_client::IntervalsError> {
                 Ok(serde_json::json!({}))
             }
@@ -2878,6 +2921,7 @@ mod tests {
                 &self,
                 _days_back: Option<i32>,
                 _sport: &str,
+                _date_range: Option<&str>,
             ) -> Result<serde_json::Value, intervals_icu_client::IntervalsError> {
                 Ok(serde_json::json!({}))
             }
@@ -3279,6 +3323,7 @@ mod tests {
                 &self,
                 _days_back: Option<i32>,
                 _sport: &str,
+                _date_range: Option<&str>,
             ) -> Result<serde_json::Value, intervals_icu_client::IntervalsError> {
                 Ok(serde_json::json!({}))
             }
@@ -3701,6 +3746,7 @@ mod tests {
             &self,
             _days_back: Option<i32>,
             _sport: &str,
+            _date_range: Option<&str>,
         ) -> Result<serde_json::Value, intervals_icu_client::IntervalsError> {
             Ok(serde_json::json!({}))
         }
@@ -4180,6 +4226,7 @@ mod tests {
                 &self,
                 _days_back: Option<i32>,
                 _sport: &str,
+                _date_range: Option<&str>,
             ) -> Result<serde_json::Value, intervals_icu_client::IntervalsError> {
                 Ok(serde_json::json!({}))
             }
@@ -4644,6 +4691,7 @@ mod tests {
                 &self,
                 _days_back: Option<i32>,
                 _sport: &str,
+                _date_range: Option<&str>,
             ) -> Result<serde_json::Value, intervals_icu_client::IntervalsError> {
                 Ok(serde_json::json!({}))
             }
@@ -5056,6 +5104,7 @@ mod tests {
                 &self,
                 _days_back: Option<i32>,
                 _sport: &str,
+                _date_range: Option<&str>,
             ) -> Result<serde_json::Value, intervals_icu_client::IntervalsError> {
                 Ok(serde_json::json!({}))
             }
@@ -5485,6 +5534,7 @@ mod tests {
                 &self,
                 _days_back: Option<i32>,
                 _sport: &str,
+                _date_range: Option<&str>,
             ) -> Result<serde_json::Value, intervals_icu_client::IntervalsError> {
                 Ok(serde_json::json!({}))
             }
@@ -5793,6 +5843,7 @@ mod tests {
                 days_back: Some(30),
                 durations: None,
                 summary: None,
+                date_range: None,
             }))
             .await;
         assert!(res.is_ok());
@@ -5840,6 +5891,7 @@ mod tests {
                 days_back: Some(7),
                 durations: None,
                 summary: None,
+                date_range: None,
             }))
             .await;
         assert!(res.is_ok());
@@ -6038,6 +6090,7 @@ mod tests {
                 &self,
                 _days_back: Option<i32>,
                 _sport: &str,
+                _date_range: Option<&str>,
             ) -> Result<serde_json::Value, intervals_icu_client::IntervalsError> {
                 Ok(serde_json::json!({}))
             }
@@ -6932,17 +6985,17 @@ mod tests {
             .and_then(|v| v.as_array())
             .expect("curve");
 
-        // Should only include key durations: 5, 30, 60, 300, 1200, 3600
+        // Should only include the proxy-compatible key durations.
         let secs: Vec<u64> = curve
             .iter()
             .filter_map(|v| v.get("secs").and_then(|s| s.as_u64()))
             .collect();
         assert!(secs.contains(&5));
         assert!(secs.contains(&60));
+        assert!(secs.contains(&120));
         assert!(secs.contains(&300));
         assert!(secs.contains(&3600));
         assert!(!secs.contains(&10), "10s not a key duration");
-        assert!(!secs.contains(&120), "120s not a key duration");
     }
 
     #[test]
@@ -7229,6 +7282,7 @@ mod tests {
             days_back: Some(30),
             durations: None,
             summary: None,
+            date_range: None,
         };
         let res = handler.get_hr_curves(Parameters(params)).await;
         assert!(res.is_ok());
@@ -7243,6 +7297,7 @@ mod tests {
             days_back: Some(30),
             durations: None,
             summary: None,
+            date_range: None,
         };
         let res = handler.get_pace_curves(Parameters(params)).await;
         assert!(res.is_ok());

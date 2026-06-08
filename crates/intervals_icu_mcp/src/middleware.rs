@@ -858,6 +858,7 @@ mod tests {
             &self,
             _days_back: Option<i32>,
             _sport: &str,
+            _date_range: Option<&str>,
         ) -> Result<serde_json::Value, IntervalsError> {
             Ok(serde_json::json!({}))
         }
