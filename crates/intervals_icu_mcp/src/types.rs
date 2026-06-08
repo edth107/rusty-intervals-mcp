@@ -341,6 +341,19 @@ pub struct StreamsParams {
     pub summary: Option<bool>,
     /// Specific streams to return (e.g., ["power", "heartrate"]). Default: all available.
     pub streams: Option<Vec<String>>,
+    /// Optional elapsed-time window to slice streams before summary/downsampling.
+    pub window: Option<StreamWindow>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct StreamWindow {
+    /// Window type. Currently only "elapsed_time" is supported.
+    #[serde(rename = "type")]
+    pub window_type: Option<String>,
+    /// Start time since activity start, e.g. "42:30" or "00:42:30".
+    pub start: String,
+    /// Exclusive end time since activity start, e.g. "47:30" or "00:47:30".
+    pub end: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]

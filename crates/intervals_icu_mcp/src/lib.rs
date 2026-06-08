@@ -451,7 +451,7 @@ impl IntervalsMcpHandler {
 
     #[tool(
         name = "get_activity_streams",
-        description = "Get activity streams. Params: activity_id, max_points (downsample), summary (stats only), streams (filter)."
+        description = "Get activity streams. Params: activity_id, max_points (downsample), summary (stats only), streams (filter), window ({type: elapsed_time, start, end})."
     )]
     async fn get_activity_streams(
         &self,
@@ -459,19 +459,27 @@ impl IntervalsMcpHandler {
     ) -> Result<Json<ObjectResult>, String> {
         let p = params.0;
         let stream_filter = p.streams.clone();
+        let api_stream_filter =
+            Self::stream_filter_for_api(stream_filter.clone(), p.window.is_some());
         let v = self
             .client
-            .get_activity_streams(&p.activity_id, stream_filter.clone())
+            .get_activity_streams(&p.activity_id, api_stream_filter)
             .await
             .map_err(|e| e.to_string())?;
 
         // Apply compact transformations if requested
-        let result =
-            Self::transform_streams(v, p.max_points, p.summary.unwrap_or(true), stream_filter);
+        let result = Self::transform_streams_with_window(
+            v,
+            p.max_points,
+            p.summary.unwrap_or(true),
+            stream_filter,
+            p.window.as_ref(),
+        )?;
         Ok(Json(ObjectResult { value: result }))
     }
 
     /// Transform streams: downsample to max_points, compute summary stats, filter by stream names
+    #[cfg(test)]
     fn transform_streams(
         value: serde_json::Value,
         max_points: Option<u32>,
@@ -484,6 +492,44 @@ impl IntervalsMcpHandler {
             summary_only,
             filter_streams,
         )
+    }
+
+    fn transform_streams_with_window(
+        value: serde_json::Value,
+        max_points: Option<u32>,
+        summary_only: bool,
+        filter_streams: Option<Vec<String>>,
+        window: Option<&StreamWindow>,
+    ) -> Result<serde_json::Value, String> {
+        domains::activity_analysis::transform_streams_with_window(
+            value,
+            max_points,
+            summary_only,
+            filter_streams,
+            window,
+        )
+    }
+
+    fn stream_filter_for_api(
+        stream_filter: Option<Vec<String>>,
+        needs_time_stream: bool,
+    ) -> Option<Vec<String>> {
+        if !needs_time_stream {
+            return stream_filter;
+        }
+
+        let Some(mut streams) = stream_filter else {
+            return None;
+        };
+
+        if !streams
+            .iter()
+            .any(|stream| stream.eq_ignore_ascii_case("time"))
+        {
+            streams.push("time".to_string());
+        }
+
+        Some(streams)
     }
 
     #[tool(
@@ -4015,6 +4061,7 @@ mod tests {
             max_points: None,
             summary: None,
             streams: None,
+            window: None,
         };
         let res = handler
             .get_activity_streams(Parameters(streams_param))
@@ -6680,6 +6727,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stream_filter_for_api_adds_time_for_window() {
+        let api_filter = IntervalsMcpHandler::stream_filter_for_api(
+            Some(vec!["watts".into(), "cadence".into()]),
+            true,
+        )
+        .expect("filter should remain bounded");
+
+        assert!(api_filter.iter().any(|stream| stream == "watts"));
+        assert!(api_filter.iter().any(|stream| stream == "cadence"));
+        assert!(api_filter.iter().any(|stream| stream == "time"));
+
+        let unbounded = IntervalsMcpHandler::stream_filter_for_api(None, true);
+        assert!(unbounded.is_none());
+    }
+
     #[tokio::test]
     async fn get_activity_streams_downsample_and_filter() {
         use std::sync::Arc;
@@ -6692,6 +6755,7 @@ mod tests {
             max_points: Some(3),
             summary: Some(false),
             streams: None,
+            window: None,
         };
         let res = handler
             .get_activity_streams(Parameters(params))
@@ -6713,6 +6777,7 @@ mod tests {
             max_points: None,
             summary: Some(true),
             streams: None,
+            window: None,
         };
         let res = handler
             .get_activity_streams(Parameters(params))

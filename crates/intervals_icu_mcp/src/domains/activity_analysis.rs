@@ -16,6 +16,8 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
+use crate::types::StreamWindow;
+
 const KEY_DURATIONS: &[u32] = &[1, 5, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600];
 
 pub fn transform_streams(
@@ -52,6 +54,75 @@ pub fn transform_streams(
     }
 }
 
+pub fn transform_streams_with_window(
+    value: Value,
+    max_points: Option<u32>,
+    summary_only: bool,
+    filter_streams: Option<Vec<String>>,
+    window: Option<&StreamWindow>,
+) -> Result<Value, String> {
+    let Some(window) = window else {
+        return Ok(transform_streams(
+            value,
+            max_points,
+            summary_only,
+            filter_streams,
+        ));
+    };
+
+    let elapsed_window = ElapsedWindow::from_params(window)?;
+    transform_windowed_streams(
+        value,
+        max_points,
+        summary_only,
+        filter_streams.as_deref(),
+        &elapsed_window,
+    )
+}
+
+fn transform_windowed_streams(
+    value: Value,
+    max_points: Option<u32>,
+    summary_only: bool,
+    filter_streams: Option<&[String]>,
+    window: &ElapsedWindow,
+) -> Result<Value, String> {
+    match value {
+        Value::Array(streams) if is_stream_list(&streams) => transform_stream_list_with_window(
+            streams,
+            max_points,
+            summary_only,
+            filter_streams,
+            window,
+        ),
+        Value::Object(mut obj) => {
+            if let Some(streams) = obj.remove("streams") {
+                let transformed = transform_windowed_streams(
+                    streams,
+                    max_points,
+                    summary_only,
+                    filter_streams,
+                    window,
+                )?;
+                obj.insert("streams".to_string(), transformed);
+                return Ok(Value::Object(obj));
+            }
+
+            transform_stream_object_with_window(
+                obj,
+                max_points,
+                summary_only,
+                filter_streams,
+                window,
+            )
+        }
+        Value::Array(_) => {
+            Err("window requires Intervals stream data with a time stream".to_string())
+        }
+        _ => Err("window requires stream data with a time stream".to_string()),
+    }
+}
+
 fn transform_stream_object(
     obj: Map<String, Value>,
     max_points: Option<u32>,
@@ -83,6 +154,37 @@ fn transform_stream_object(
     }
 
     Value::Object(result)
+}
+
+fn transform_stream_object_with_window(
+    obj: Map<String, Value>,
+    max_points: Option<u32>,
+    summary_only: bool,
+    filter_streams: Option<&[String]>,
+    window: &ElapsedWindow,
+) -> Result<Value, String> {
+    let time_data = find_time_stream_in_object(&obj)
+        .ok_or_else(|| "window requires a time stream, but none was returned".to_string())?;
+    let indices = window.indices_for(time_data);
+    let mut result = Map::new();
+    result.insert("window".to_string(), window.metadata(&indices));
+
+    for (key, val) in obj {
+        if !stream_matches_filter(&key, filter_streams) {
+            continue;
+        }
+
+        let Some(arr) = val.as_array() else {
+            result.insert(key.clone(), val.clone());
+            continue;
+        };
+
+        let sliced = slice_array(arr, indices.start_index, indices.end_index);
+        let value = transform_stream_array(&sliced, max_points, summary_only);
+        result.insert(key, value);
+    }
+
+    Ok(Value::Object(result))
 }
 
 fn transform_stream_list(
@@ -124,6 +226,52 @@ fn transform_stream_list(
     Value::Object(result)
 }
 
+fn transform_stream_list_with_window(
+    streams: Vec<Value>,
+    max_points: Option<u32>,
+    summary_only: bool,
+    filter_streams: Option<&[String]>,
+    window: &ElapsedWindow,
+) -> Result<Value, String> {
+    let time_data = streams
+        .iter()
+        .filter_map(Value::as_object)
+        .find_map(|obj| {
+            let stream_type = stream_type_from_object(obj);
+            if stream_type.eq_ignore_ascii_case("time") {
+                obj.get("data").and_then(Value::as_array)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| "window requires a time stream, but none was returned".to_string())?;
+
+    let indices = window.indices_for(time_data);
+    let mut result = Map::new();
+    result.insert("window".to_string(), window.metadata(&indices));
+
+    for stream in streams {
+        let Some(obj) = stream.as_object() else {
+            continue;
+        };
+        let stream_type = stream_type_from_object(obj);
+
+        if !stream_matches_filter(stream_type, filter_streams) {
+            continue;
+        }
+
+        let Some(data) = obj.get("data").and_then(Value::as_array) else {
+            continue;
+        };
+
+        let sliced = slice_array(data, indices.start_index, indices.end_index);
+        let value = transform_stream_array(&sliced, max_points, summary_only);
+        result.insert(stream_type.to_string(), value);
+    }
+
+    Ok(Value::Object(result))
+}
+
 fn is_stream_list(streams: &[Value]) -> bool {
     streams
         .first()
@@ -137,6 +285,159 @@ fn stream_matches_filter(stream_type: &str, filter_streams: Option<&[String]>) -
     filter_streams
         .map(|filter| filter.iter().any(|f| f.eq_ignore_ascii_case(stream_type)))
         .unwrap_or(true)
+}
+
+fn stream_type_from_object(obj: &Map<String, Value>) -> &str {
+    obj.get("type")
+        .or_else(|| obj.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+}
+
+fn find_time_stream_in_object(obj: &Map<String, Value>) -> Option<&Vec<Value>> {
+    obj.get("time").and_then(Value::as_array).or_else(|| {
+        obj.iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("time"))
+            .and_then(|(_, value)| value.as_array())
+    })
+}
+
+fn transform_stream_array(arr: &[Value], max_points: Option<u32>, summary_only: bool) -> Value {
+    if summary_only {
+        compute_stream_stats(arr)
+    } else if let Some(max) = max_points {
+        Value::Array(downsample_array(arr, max as usize))
+    } else {
+        Value::Array(arr.to_vec())
+    }
+}
+
+fn slice_array(arr: &[Value], start_index: usize, end_index: usize) -> Vec<Value> {
+    let start = start_index.min(arr.len());
+    let end = end_index.min(arr.len()).max(start);
+    arr[start..end].to_vec()
+}
+
+#[derive(Debug)]
+struct ElapsedWindow {
+    requested_start: String,
+    requested_end: String,
+    start_seconds: f64,
+    end_seconds: f64,
+}
+
+#[derive(Debug)]
+struct WindowIndices {
+    start_index: usize,
+    end_index: usize,
+}
+
+impl ElapsedWindow {
+    fn from_params(params: &StreamWindow) -> Result<Self, String> {
+        let window_type = params.window_type.as_deref().unwrap_or("elapsed_time");
+        if !window_type.eq_ignore_ascii_case("elapsed_time") {
+            return Err(format!(
+                "unsupported stream window type '{window_type}', expected 'elapsed_time'"
+            ));
+        }
+
+        let start_seconds = parse_elapsed_seconds(&params.start)?;
+        let end_seconds = parse_elapsed_seconds(&params.end)?;
+        if end_seconds <= start_seconds {
+            return Err("stream window end must be after start".to_string());
+        }
+
+        Ok(Self {
+            requested_start: params.start.clone(),
+            requested_end: params.end.clone(),
+            start_seconds,
+            end_seconds,
+        })
+    }
+
+    fn indices_for(&self, time_data: &[Value]) -> WindowIndices {
+        let start_index = first_index_at_or_after(time_data, self.start_seconds);
+        let end_index = first_index_at_or_after(time_data, self.end_seconds);
+        WindowIndices {
+            start_index,
+            end_index: end_index.max(start_index),
+        }
+    }
+
+    fn metadata(&self, indices: &WindowIndices) -> Value {
+        serde_json::json!({
+            "type": "elapsed_time",
+            "requested_start": self.requested_start,
+            "requested_end": self.requested_end,
+            "start_seconds": self.start_seconds,
+            "end_seconds": self.end_seconds,
+            "start_index": indices.start_index,
+            "end_index": indices.end_index,
+            "end_exclusive": true,
+            "points": indices.end_index.saturating_sub(indices.start_index)
+        })
+    }
+}
+
+fn parse_elapsed_seconds(input: &str) -> Result<f64, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("elapsed time cannot be empty".to_string());
+    }
+
+    if let Ok(seconds) = trimmed.parse::<f64>() {
+        if seconds.is_finite() && seconds >= 0.0 {
+            return Ok(seconds);
+        }
+        return Err(format!(
+            "elapsed time '{input}' must be a non-negative number"
+        ));
+    }
+
+    let parts: Vec<&str> = trimmed.split(':').collect();
+    let seconds = match parts.as_slice() {
+        [minutes, seconds] => {
+            parse_time_part(minutes, input)? * 60.0 + parse_time_part(seconds, input)?
+        }
+        [hours, minutes, seconds] => {
+            parse_time_part(hours, input)? * 3600.0
+                + parse_time_part(minutes, input)? * 60.0
+                + parse_time_part(seconds, input)?
+        }
+        _ => {
+            return Err(format!(
+                "elapsed time '{input}' must use seconds, MM:SS, or HH:MM:SS"
+            ));
+        }
+    };
+
+    Ok(seconds)
+}
+
+fn parse_time_part(part: &str, original: &str) -> Result<f64, String> {
+    let value = part
+        .parse::<f64>()
+        .map_err(|_| format!("elapsed time '{original}' contains an invalid component '{part}'"))?;
+    if value.is_finite() && value >= 0.0 {
+        Ok(value)
+    } else {
+        Err(format!(
+            "elapsed time '{original}' contains a negative or invalid component '{part}'"
+        ))
+    }
+}
+
+fn first_index_at_or_after(time_data: &[Value], target_seconds: f64) -> usize {
+    time_data
+        .iter()
+        .position(|value| value_to_seconds(value).is_some_and(|seconds| seconds >= target_seconds))
+        .unwrap_or(time_data.len())
+}
+
+fn value_to_seconds(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|s| parse_elapsed_seconds(s).ok()))
 }
 
 pub fn compute_stream_stats(arr: &[Value]) -> Value {
@@ -693,6 +994,126 @@ mod tests {
 
         let result = transform_streams(input, Some(3), false, None);
         assert_eq!(result["watts"], serde_json::json!([1, 3, 5]));
+    }
+
+    #[test]
+    fn transform_streams_window_slices_before_summary() {
+        let input = serde_json::json!([
+            {"type": "time", "data": [0, 60, 120, 180, 240]},
+            {"type": "watts", "data": [100, 200, 300, 400, 500]},
+            {"type": "cadence", "data": [80, 81, 82, 83, 84]}
+        ]);
+        let window = StreamWindow {
+            window_type: Some("elapsed_time".to_string()),
+            start: "00:01:00".to_string(),
+            end: "00:04:00".to_string(),
+        };
+
+        let result = transform_streams_with_window(
+            input,
+            None,
+            true,
+            Some(vec!["watts".into()]),
+            Some(&window),
+        )
+        .expect("window transform should succeed");
+
+        assert!(result.get("time").is_none());
+        assert!(result.get("cadence").is_none());
+        assert_eq!(result["window"]["start_index"], 1);
+        assert_eq!(result["window"]["end_index"], 4);
+        assert_eq!(result["window"]["points"], 3);
+        assert_eq!(result["watts"]["count"], 3);
+        assert_eq!(result["watts"]["avg"], 300.0);
+        assert_eq!(result["watts"]["p90"], 400.0);
+    }
+
+    #[test]
+    fn transform_streams_window_slices_before_downsample() {
+        let input = serde_json::json!([
+            {"type": "time", "data": [0, 60, 120, 180, 240]},
+            {"type": "watts", "data": [100, 200, 300, 400, 500]}
+        ]);
+        let window = StreamWindow {
+            window_type: None,
+            start: "01:00".to_string(),
+            end: "04:00".to_string(),
+        };
+
+        let result = transform_streams_with_window(
+            input,
+            Some(2),
+            false,
+            Some(vec!["watts".into()]),
+            Some(&window),
+        )
+        .expect("window transform should succeed");
+
+        assert_eq!(result["watts"], serde_json::json!([200, 400]));
+        assert_eq!(result["window"]["end_exclusive"], true);
+    }
+
+    #[test]
+    fn transform_streams_window_handles_nested_object_streams() {
+        let input = serde_json::json!({
+            "id": "a1",
+            "streams": {
+                "time": [0, 1, 2, 3, 4],
+                "watts": [10, 20, 30, 40, 50]
+            }
+        });
+        let window = StreamWindow {
+            window_type: Some("elapsed_time".to_string()),
+            start: "1".to_string(),
+            end: "4".to_string(),
+        };
+
+        let result = transform_streams_with_window(
+            input,
+            None,
+            false,
+            Some(vec!["watts".into()]),
+            Some(&window),
+        )
+        .expect("window transform should succeed");
+
+        assert_eq!(result["id"], "a1");
+        assert_eq!(result["streams"]["watts"], serde_json::json!([20, 30, 40]));
+        assert!(result["streams"].get("time").is_none());
+        assert_eq!(result["streams"]["window"]["points"], 3);
+    }
+
+    #[test]
+    fn transform_streams_window_rejects_invalid_range() {
+        let input = serde_json::json!([
+            {"type": "time", "data": [0, 60, 120]},
+            {"type": "watts", "data": [100, 200, 300]}
+        ]);
+        let window = StreamWindow {
+            window_type: Some("elapsed_time".to_string()),
+            start: "02:00".to_string(),
+            end: "01:00".to_string(),
+        };
+
+        let err = transform_streams_with_window(input, None, true, None, Some(&window))
+            .expect_err("end before start should fail");
+        assert!(err.contains("end must be after start"));
+    }
+
+    #[test]
+    fn transform_streams_window_rejects_missing_time_stream() {
+        let input = serde_json::json!([
+            {"type": "watts", "data": [100, 200, 300]}
+        ]);
+        let window = StreamWindow {
+            window_type: Some("ELAPSED_TIME".to_string()),
+            start: "00:00:00".to_string(),
+            end: "00:01:00".to_string(),
+        };
+
+        let err = transform_streams_with_window(input, None, true, None, Some(&window))
+            .expect_err("window without time should fail");
+        assert!(err.contains("time stream"));
     }
 
     #[test]
