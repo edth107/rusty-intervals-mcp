@@ -346,6 +346,7 @@ pub struct StreamsParams {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[schemars(inline)]
 pub struct StreamWindow {
     /// Window type. Currently only "elapsed_time" is supported.
     #[serde(rename = "type")]
