@@ -553,7 +553,7 @@ impl IntervalsMcpHandler {
 
     #[tool(
         name = "get_activity_intervals",
-        description = "Get workout intervals. Params: activity_id, summary (default true), max_intervals (default 20), fields (filter)."
+        description = "Get workout intervals. Params: activity_id, summary (default true), max_intervals (default 100), fields (extra raw fields). summary=false returns compact intervals with window objects."
     )]
     async fn get_activity_intervals(
         &self,
@@ -569,8 +569,8 @@ impl IntervalsMcpHandler {
         // Apply compact transformations
         let result = Self::transform_intervals(
             &v,
-            p.summary.unwrap_or(false),
-            p.max_intervals.unwrap_or(20) as usize,
+            p.summary.unwrap_or(true),
+            p.max_intervals.unwrap_or(100) as usize,
             p.fields.as_deref(),
         );
 
@@ -6983,36 +6983,103 @@ mod tests {
     #[test]
     fn transform_intervals_summary_mode() {
         let input = serde_json::json!([
-            {"type": "work", "duration": 300, "distance": 1000},
-            {"type": "rest", "duration": 60, "distance": 100},
-            {"type": "work", "duration": 300, "distance": 1000}
+            {"type": "WORK", "elapsed_time": 300, "moving_time": 300, "zone": 4},
+            {"type": "RECOVERY", "elapsed_time": 60, "moving_time": 50, "zone": 1},
+            {"type": "WORK", "elapsed_time": 300, "moving_time": 290, "zone": 4}
         ]);
 
-        let result = IntervalsMcpHandler::transform_intervals(&input, true, 20, None);
+        let result = IntervalsMcpHandler::transform_intervals(&input, true, 100, None);
 
-        assert_eq!(
-            result.get("total_intervals").and_then(|v| v.as_u64()),
-            Some(3)
-        );
+        assert_eq!(result.get("count").and_then(|v| v.as_u64()), Some(3));
         assert!(result.get("types").is_some());
-        assert!(result.get("total_duration_secs").is_some());
-        assert!(result.get("avg_duration_secs").is_some());
+        assert_eq!(result["work_count"], 2);
+        assert_eq!(result["recovery_count"], 1);
+        assert_eq!(result["total_work_time"], 590.0);
+        assert!(result.get("avg_elapsed_time").is_some());
     }
 
     #[test]
-    fn transform_intervals_limits_and_filters() {
+    fn transform_intervals_returns_window_ready_compact_list() {
+        let input = serde_json::json!({
+            "id": "i1",
+            "icu_intervals": [
+                {
+                    "id": 1,
+                    "type": "WORK",
+                    "zone": 6,
+                    "zone_min_watts": 254,
+                    "zone_max_watts": 289,
+                    "start_time": 1170,
+                    "end_time": 1230,
+                    "start_index": 1170,
+                    "end_index": 1230,
+                    "elapsed_time": 60,
+                    "moving_time": 60,
+                    "average_watts": 260,
+                    "weighted_average_watts": 261,
+                    "average_heartrate": 153,
+                    "max_heartrate": 157,
+                    "average_cadence": 90,
+                    "average_torque": 27.5,
+                    "max_torque": 31.2,
+                    "joules": 12345
+                },
+                {"id": 2, "type": "RECOVERY", "start_time": 1230, "end_time": 1290}
+            ]
+        });
+
+        let result = IntervalsMcpHandler::transform_intervals(&input, false, 1, None);
+        let intervals = result["intervals"].as_array().expect("intervals array");
+
+        assert_eq!(result["activity_id"], "i1");
+        assert_eq!(result["source"], "icu_intervals");
+        assert_eq!(result["count"], 2);
+        assert_eq!(result["max_intervals"], 1);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(intervals.len(), 1);
+        assert_eq!(intervals[0]["type"], "WORK");
+        assert_eq!(intervals[0]["zone"], 6);
+        assert_eq!(intervals[0]["start_seconds"], 1170.0);
+        assert_eq!(intervals[0]["end_seconds"], 1230.0);
+        assert_eq!(intervals[0]["window"]["start"], "19:30");
+        assert_eq!(intervals[0]["window"]["end"], "20:30");
+        assert_eq!(intervals[0]["stats"]["average_watts"], 260);
+        assert!(intervals[0].get("joules").is_none());
+    }
+
+    #[test]
+    fn transform_intervals_includes_extra_fields_on_request() {
         let input = serde_json::json!([
-            {"type": "work", "duration": 300, "distance": 1000, "intensity": 80},
-            {"type": "rest", "duration": 60, "distance": 100, "intensity": 40},
-            {"type": "work", "duration": 300, "distance": 1000, "intensity": 85}
+            {"type": "WORK", "start_time": 0, "end_time": 60, "joules": 12345}
         ]);
+        let fields = vec!["joules".to_string()];
+        let result = IntervalsMcpHandler::transform_intervals(&input, false, 100, Some(&fields));
+        let intervals = result["intervals"].as_array().expect("intervals array");
 
-        let result = IntervalsMcpHandler::transform_intervals(&input, false, 2, None);
-        let arr = result.as_array().expect("array");
+        assert_eq!(intervals[0]["joules"], 12345);
+    }
 
-        assert_eq!(arr.len(), 2, "should limit to 2 intervals");
-        assert!(arr[0].get("type").is_some());
-        assert!(arr[0].get("duration").is_some());
+    #[tokio::test]
+    async fn get_activity_intervals_defaults_to_summary() {
+        let client = MockClient;
+        let handler = IntervalsMcpHandler::new(Arc::new(client));
+        let params = ActivityIntervalsParams {
+            activity_id: "a1".into(),
+            summary: None,
+            max_intervals: None,
+            fields: None,
+        };
+
+        let res = handler
+            .get_activity_intervals(Parameters(params))
+            .await
+            .expect("should succeed")
+            .0
+            .value;
+
+        assert_eq!(res["count"], 1);
+        assert_eq!(res["source"], "intervals");
+        assert!(res.get("intervals").is_none());
     }
 
     #[tokio::test]

@@ -442,6 +442,21 @@ Several tools support **compact mode** to reduce token usage:
 {"activity_id": "i123", "streams": ["watts"], "window": {"start": "42:30", "end": "47:30"}}
 ```
 
+#### `get_activity_intervals`
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `activity_id` | string | Activity ID (required) |
+| `summary` | boolean | Return a compact activity-level interval summary (default: true) |
+| `max_intervals` | integer | Limit returned intervals when `summary=false` (default: 100) |
+| `fields` | array | Extra raw interval fields to include; default stays compact |
+
+With `summary=false`, returns `intervals[]` containing API zones, timing, a `window` object for `get_activity_streams`, and compact stats.
+
+**Example - Window-ready intervals:**
+```json
+{"activity_id": "i123", "summary": false, "max_intervals": 100}
+```
+
 #### `get_activity_details`
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -490,7 +505,7 @@ Several tools support **compact mode** to reduce token usage:
 | Tool | Description |
 |------|-------------|
 | `get_activity_streams` | Get time-series data with compact options (`max_points`, `summary`, `streams`) |
-| `get_activity_intervals` | Get structured workout intervals with targets and performance |
+| `get_activity_intervals` | Get structured workout intervals as summaries or window-ready compact intervals |
 | `get_best_efforts` | Find peak performances across all durations in an activity |
 | `search_intervals` | Find similar intervals across activity history |
 | `get_power_histogram` | Get power distribution histogram for an activity |

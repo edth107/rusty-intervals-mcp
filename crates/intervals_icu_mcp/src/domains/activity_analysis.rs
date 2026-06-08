@@ -537,69 +537,217 @@ pub fn transform_intervals(
     max_intervals: usize,
     fields: Option<&[String]>,
 ) -> Value {
-    let Some(arr) = value.as_array() else {
+    let activity_id = value
+        .get("id")
+        .or_else(|| value.get("activity_id"))
+        .and_then(Value::as_str);
+
+    let Some((source, arr)) = select_interval_array(value) else {
         return value.clone();
     };
 
     if summary_only {
         let total = arr.len();
         let mut type_counts: HashMap<String, usize> = HashMap::new();
-        let mut total_duration: f64 = 0.0;
-        let mut total_distance: f64 = 0.0;
+        let mut zone_counts: HashMap<String, usize> = HashMap::new();
+        let mut total_elapsed_time: f64 = 0.0;
+        let mut total_moving_time: f64 = 0.0;
+        let mut work_count = 0usize;
+        let mut recovery_count = 0usize;
+        let mut total_work_time: f64 = 0.0;
 
         for item in arr {
             if let Some(obj) = item.as_object() {
                 if let Some(t) = obj.get("type").and_then(|v| v.as_str()) {
                     *type_counts.entry(t.to_string()).or_insert(0) += 1;
+                    if t.eq_ignore_ascii_case("work") {
+                        work_count += 1;
+                        total_work_time +=
+                            number_field(obj, &["moving_time", "elapsed_time"]).unwrap_or_default();
+                    } else if t.eq_ignore_ascii_case("recovery") || t.eq_ignore_ascii_case("rest") {
+                        recovery_count += 1;
+                    }
                 }
-                if let Some(d) = obj.get("duration").and_then(|v| v.as_f64()) {
-                    total_duration += d;
+                if let Some(zone) = obj.get("zone").and_then(Value::as_i64) {
+                    *zone_counts.entry(zone.to_string()).or_insert(0) += 1;
                 }
-                if let Some(d) = obj.get("distance").and_then(|v| v.as_f64()) {
-                    total_distance += d;
+                if let Some(elapsed_time) = number_field(obj, &["elapsed_time", "duration"]) {
+                    total_elapsed_time += elapsed_time;
+                }
+                if let Some(moving_time) = number_field(obj, &["moving_time"]) {
+                    total_moving_time += moving_time;
                 }
             }
         }
 
-        return serde_json::json!({
-            "total_intervals": total,
+        let mut summary = serde_json::json!({
+            "count": total,
+            "source": source,
             "types": type_counts,
-            "total_duration_secs": total_duration,
-            "total_distance_m": total_distance,
-            "avg_duration_secs": if total > 0 { total_duration / total as f64 } else { 0.0 }
+            "zones": zone_counts,
+            "work_count": work_count,
+            "recovery_count": recovery_count,
+            "total_elapsed_time": total_elapsed_time,
+            "total_moving_time": total_moving_time,
+            "total_work_time": total_work_time,
+            "avg_elapsed_time": if total > 0 { total_elapsed_time / total as f64 } else { 0.0 }
         });
-    }
 
-    let default_fields = [
-        "type",
-        "start_index",
-        "end_index",
-        "duration",
-        "distance",
-        "intensity",
-    ];
-    let fields_to_use: Vec<&str> = fields
-        .map(|f| f.iter().map(|s| s.as_str()).collect())
-        .unwrap_or_else(|| default_fields.to_vec());
+        if let Some(activity_id) = activity_id
+            && let Some(obj) = summary.as_object_mut()
+        {
+            obj.insert(
+                "activity_id".to_string(),
+                Value::String(activity_id.to_string()),
+            );
+        }
+
+        return summary;
+    }
 
     let limited: Vec<Value> = arr
         .iter()
         .take(max_intervals)
-        .map(|item| {
-            let Some(obj) = item.as_object() else {
-                return item.clone();
-            };
-            let mut result = Map::new();
-            for field in &fields_to_use {
-                if let Some(val) = obj.get(*field) {
-                    result.insert(field.to_string(), val.clone());
-                }
-            }
-            Value::Object(result)
-        })
+        .filter_map(|item| item.as_object())
+        .map(|obj| compact_interval(obj, fields))
         .collect();
 
-    Value::Array(limited)
+    let mut result = Map::new();
+    if let Some(activity_id) = activity_id {
+        result.insert(
+            "activity_id".to_string(),
+            Value::String(activity_id.to_string()),
+        );
+    }
+    result.insert("source".to_string(), Value::String(source.to_string()));
+    result.insert("count".to_string(), Value::from(arr.len()));
+    result.insert("max_intervals".to_string(), Value::from(max_intervals));
+    result.insert(
+        "truncated".to_string(),
+        Value::from(arr.len() > max_intervals),
+    );
+    result.insert("intervals".to_string(), Value::Array(limited));
+
+    Value::Object(result)
+}
+
+fn select_interval_array(value: &Value) -> Option<(&'static str, &Vec<Value>)> {
+    if let Some(arr) = value.as_array() {
+        return Some(("intervals", arr));
+    }
+
+    let obj = value.as_object()?;
+    for key in ["icu_intervals", "intervals", "icu_groups"] {
+        if let Some(arr) = obj.get(key).and_then(Value::as_array) {
+            return Some((key, arr));
+        }
+    }
+
+    None
+}
+
+fn compact_interval(obj: &Map<String, Value>, extra_fields: Option<&[String]>) -> Value {
+    let mut result = Map::new();
+
+    copy_field(obj, &mut result, "id");
+    copy_field(obj, &mut result, "label");
+    copy_field(obj, &mut result, "name");
+    copy_field(obj, &mut result, "type");
+    copy_field(obj, &mut result, "zone");
+    copy_field(obj, &mut result, "zone_min_watts");
+    copy_field(obj, &mut result, "zone_max_watts");
+
+    if let Some(start_seconds) = number_field(obj, &["start_time", "start_seconds"]) {
+        result.insert("start_seconds".to_string(), Value::from(start_seconds));
+    }
+    if let Some(end_seconds) = number_field(obj, &["end_time", "end_seconds"]) {
+        result.insert("end_seconds".to_string(), Value::from(end_seconds));
+    }
+    copy_field(obj, &mut result, "start_index");
+    copy_field(obj, &mut result, "end_index");
+    copy_field(obj, &mut result, "elapsed_time");
+    copy_field(obj, &mut result, "moving_time");
+
+    if let Some(window) = interval_window(obj) {
+        result.insert("window".to_string(), window);
+    }
+
+    let stats = interval_stats(obj);
+    if !stats.is_empty() {
+        result.insert("stats".to_string(), Value::Object(stats));
+    }
+
+    if let Some(extra_fields) = extra_fields {
+        for field in extra_fields {
+            if result.contains_key(field) {
+                continue;
+            }
+            if let Some(value) = obj.get(field) {
+                result.insert(field.clone(), value.clone());
+            }
+        }
+    }
+
+    Value::Object(result)
+}
+
+fn interval_window(obj: &Map<String, Value>) -> Option<Value> {
+    let start_seconds = number_field(obj, &["start_time", "start_seconds"])?;
+    let end_seconds = number_field(obj, &["end_time", "end_seconds"])?;
+
+    Some(serde_json::json!({
+        "type": "elapsed_time",
+        "start": format_elapsed_time(start_seconds),
+        "end": format_elapsed_time(end_seconds)
+    }))
+}
+
+fn interval_stats(obj: &Map<String, Value>) -> Map<String, Value> {
+    let mut stats = Map::new();
+    for field in [
+        "average_watts",
+        "weighted_average_watts",
+        "average_heartrate",
+        "max_heartrate",
+        "average_cadence",
+        "average_torque",
+        "max_torque",
+    ] {
+        copy_field(obj, &mut stats, field);
+    }
+    stats
+}
+
+fn copy_field(source: &Map<String, Value>, target: &mut Map<String, Value>, field: &str) {
+    if let Some(value) = source.get(field)
+        && !value.is_null()
+    {
+        target.insert(field.to_string(), value.clone());
+    }
+}
+
+fn number_field(obj: &Map<String, Value>, fields: &[&str]) -> Option<f64> {
+    fields.iter().find_map(|field| {
+        obj.get(*field).and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_i64().map(|number| number as f64))
+                .or_else(|| value.as_u64().map(|number| number as f64))
+        })
+    })
+}
+
+fn format_elapsed_time(seconds: f64) -> String {
+    let total_seconds = seconds.round().max(0.0) as u64;
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
 }
 
 pub fn compact_intervals(value: &Value, fields: Option<&[String]>) -> Value {

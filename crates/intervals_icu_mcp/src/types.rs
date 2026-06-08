@@ -186,9 +186,9 @@ pub struct ActivityIntervalsParams {
     pub activity_id: String,
     /// Return summary statistics only (default: true)
     pub summary: Option<bool>,
-    /// Maximum intervals to return (default: 20)
+    /// Maximum intervals to return (default: 100)
     pub max_intervals: Option<u32>,
-    /// Specific fields per interval (default: type,start_index,end_index,duration,distance)
+    /// Extra raw fields to include per compact interval.
     pub fields: Option<Vec<String>>,
 }
 
