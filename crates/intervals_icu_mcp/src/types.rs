@@ -192,6 +192,15 @@ pub struct ActivityIntervalsParams {
     pub fields: Option<Vec<String>>,
 }
 
+/// Parameters for get_activity_power_zone_stats.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ActivityPowerZoneStatsParams {
+    /// Activity ID
+    pub activity_id: String,
+    /// Minimum zone seconds before response stats are considered valid (default: 30).
+    pub min_response_seconds: Option<u32>,
+}
+
 /// Parameters for get_best_efforts with compact mode
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct BestEffortsCompactParams {

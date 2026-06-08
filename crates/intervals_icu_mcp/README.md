@@ -7,7 +7,7 @@ Current status:
 	- Athlete/profile: `get_athlete_profile`
 	- Activities: `get_recent_activities`, `get_activity_details`, `search_activities`, `update_activity`
 	- Events: `get_events`, `create_event`, `get_event`, `delete_event`, `bulk_create_events`
-	- Streams & intervals: `get_activity_streams`, `get_activity_intervals`, `get_best_efforts`
+	- Streams & intervals: `get_activity_streams`, `get_activity_intervals`, `get_activity_power_zone_stats`, `get_best_efforts`
 	- Files: `start_download`, `get_download_status`, `list_downloads`, `cancel_download` (progress & cancellation supported)
 	- Webhooks: `receive_webhook` (HMAC verification + dedupe) and a programmatic `process_webhook`
 

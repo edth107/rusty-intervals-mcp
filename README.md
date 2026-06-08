@@ -19,10 +19,10 @@ Standard MCP servers often overwhelm LLMs with raw, verbose data, consuming thou
 
 ## Overview
 
-This MCP server provides **57 tools** to interact with your Intervals.icu account, organized into 9 categories:
+This MCP server provides **58 tools** to interact with your Intervals.icu account, organized into 9 categories:
 
 - **Activities** (11 tools) - Query, search, update, delete, and download activities
-- **Activity Analysis** (8 tools) - Deep dive into streams, intervals, best efforts, and histograms
+- **Activity Analysis** (9 tools) - Deep dive into streams, zones, intervals, best efforts, and histograms
 - **Athlete** (2 tools) - Access profile, fitness metrics, and training load
 - **Wellness** (3 tools) - Track and update recovery, HRV, sleep, and health metrics
 - **Events/Calendar** (9 tools) - Manage planned workouts, races, notes with bulk operations
@@ -457,6 +457,19 @@ With `summary=false`, returns `total_count`, `returned_count`, `zone_type`, and 
 {"activity_id": "i123", "summary": false, "max_intervals": 100}
 ```
 
+#### `get_activity_power_zone_stats`
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `activity_id` | string | Activity ID (required) |
+| `min_response_seconds` | integer | Minimum seconds before response stats are valid (default: 30) |
+
+Returns activity power-zone distribution plus per-zone response stats. Each zone includes FTP-derived bounds, seconds, percent included, and `response` with `valid`, `seconds`, power, heartrate, cadence, and torque stats. Short zones return `response.valid=false` with `reason="below_min_response_seconds"`.
+
+**Example - Power zone response:**
+```json
+{"activity_id": "i123", "min_response_seconds": 30}
+```
+
 #### `get_activity_details`
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -500,12 +513,13 @@ With `summary=false`, returns `total_count`, `returned_count`, `zone_type`, and 
 | `download_fit_file` | Download activity as FIT file |
 | `download_gpx_file` | Download activity as GPX file |
 
-### Activity Analysis (8 tools)
+### Activity Analysis (9 tools)
 
 | Tool | Description |
 |------|-------------|
 | `get_activity_streams` | Get time-series data with compact options (`max_points`, `summary`, `streams`) |
 | `get_activity_intervals` | Get structured workout intervals as summaries or window-ready compact intervals |
+| `get_activity_power_zone_stats` | Get power-zone distribution and response stats for an activity |
 | `get_best_efforts` | Find peak performances across all durations in an activity |
 | `search_intervals` | Find similar intervals across activity history |
 | `get_power_histogram` | Get power distribution histogram for an activity |

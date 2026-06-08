@@ -552,6 +552,45 @@ impl IntervalsMcpHandler {
     }
 
     #[tool(
+        name = "get_activity_power_zone_stats",
+        description = "Get power-zone distribution and response stats. Params: activity_id, min_response_seconds (default 30)."
+    )]
+    async fn get_activity_power_zone_stats(
+        &self,
+        params: Parameters<ActivityPowerZoneStatsParams>,
+    ) -> Result<Json<ObjectResult>, String> {
+        let p = params.0;
+        let details = self
+            .client
+            .get_activity_details(&p.activity_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let streams = self
+            .client
+            .get_activity_streams(
+                &p.activity_id,
+                Some(vec![
+                    "time".to_string(),
+                    "watts".to_string(),
+                    "heartrate".to_string(),
+                    "cadence".to_string(),
+                    "torque".to_string(),
+                ]),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let result = domains::activity_analysis::activity_power_zone_stats(
+            &p.activity_id,
+            &details,
+            &streams,
+            p.min_response_seconds.unwrap_or(30) as usize,
+        )?;
+
+        Ok(Json(ObjectResult { value: result }))
+    }
+
+    #[tool(
         name = "get_activity_intervals",
         description = "Get workout intervals. Params: activity_id, summary (default true), max_intervals (default 100), fields (extra raw fields). summary=false returns count metadata and window intervals."
     )]
@@ -2100,6 +2139,11 @@ mod tests {
         assert!(tools.iter().any(|t| t.name == "search_activities_full"));
         assert!(tools.iter().any(|t| t.name == "update_activity"));
         assert!(tools.iter().any(|t| t.name == "get_activity_streams"));
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.name == "get_activity_power_zone_stats")
+        );
         assert!(tools.iter().any(|t| t.name == "get_activity_intervals"));
         assert!(tools.iter().any(|t| t.name == "get_best_efforts"));
         assert!(tools.iter().any(|t| t.name == "download_fit_file"));
@@ -2145,7 +2189,7 @@ mod tests {
         assert!(tools.iter().any(|t| t.name == "update_folder"));
         assert!(tools.iter().any(|t| t.name == "delete_folder"));
         // Ensure the number of registered tools matches the documented implementation
-        assert_eq!(handler.tool_count(), 57, "Should register 57 tools");
+        assert_eq!(handler.tool_count(), 58, "Should register 58 tools");
     }
 
     #[test]

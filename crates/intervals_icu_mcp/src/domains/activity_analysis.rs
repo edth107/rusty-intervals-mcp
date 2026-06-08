@@ -512,6 +512,476 @@ pub fn compute_stream_stats(arr: &[Value]) -> Value {
     })
 }
 
+#[derive(Debug, Clone)]
+struct PowerZoneDefinition {
+    index: usize,
+    zone: String,
+    label: String,
+    min_percent_ftp: f64,
+    max_percent_ftp: f64,
+    min_watts: i64,
+    max_watts: Option<i64>,
+}
+
+pub fn activity_power_zone_stats(
+    activity_id: &str,
+    details: &Value,
+    streams: &Value,
+    min_response_seconds: usize,
+) -> Result<Value, String> {
+    let effective_ftp = extract_effective_ftp(details)
+        .ok_or_else(|| "activity power-zone stats require an activity FTP".to_string())?;
+    if effective_ftp <= 0.0 {
+        return Err("activity power-zone stats require a positive FTP".to_string());
+    }
+
+    let zone_bounds = extract_power_zone_bounds(details)
+        .ok_or_else(|| "activity power-zone stats require power-zone bounds".to_string())?;
+    if zone_bounds.is_empty() {
+        return Err("activity power-zone stats require at least one power zone".to_string());
+    }
+
+    let watts = stream_data(streams, "watts")
+        .ok_or_else(|| "activity power-zone stats require a watts stream".to_string())?;
+    let time = stream_data(streams, "time");
+    let heartrate = stream_data(streams, "heartrate");
+    let cadence = stream_data(streams, "cadence");
+    let torque = stream_data(streams, "torque");
+
+    let zones = build_power_zone_definitions(details, effective_ftp, &zone_bounds);
+    let zone_times = extract_zone_times(details);
+    let mut indexes_by_zone: Vec<Vec<usize>> = vec![Vec::new(); zones.len()];
+
+    for (index, value) in watts.iter().enumerate() {
+        let Some(watts_value) = numeric_value(value) else {
+            continue;
+        };
+        let zone_index = zone_index_for_watts(watts_value, effective_ftp, &zone_bounds);
+        if let Some(indexes) = indexes_by_zone.get_mut(zone_index) {
+            indexes.push(index);
+        }
+    }
+
+    let total_elapsed_seconds = total_elapsed_seconds(details, time, watts.len());
+    let classified_seconds: usize = indexes_by_zone.iter().map(Vec::len).sum();
+    let included_seconds =
+        zone_times
+            .values()
+            .copied()
+            .sum::<usize>()
+            .max(if zone_times.is_empty() {
+                classified_seconds
+            } else {
+                0
+            });
+    let excluded_seconds = total_elapsed_seconds.saturating_sub(included_seconds);
+
+    let zone_values: Vec<Value> = zones
+        .iter()
+        .map(|zone| {
+            let response_indexes = indexes_by_zone
+                .get(zone.index)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let seconds = zone_times
+                .get(&zone.zone)
+                .copied()
+                .unwrap_or(response_indexes.len());
+            let mut zone_obj = Map::new();
+            zone_obj.insert("zone".to_string(), Value::String(zone.zone.clone()));
+            zone_obj.insert("label".to_string(), Value::String(zone.label.clone()));
+            insert_number(&mut zone_obj, "min_percent_ftp", zone.min_percent_ftp);
+            insert_number(&mut zone_obj, "max_percent_ftp", zone.max_percent_ftp);
+            zone_obj.insert("min_watts".to_string(), Value::from(zone.min_watts));
+            zone_obj.insert(
+                "max_watts".to_string(),
+                zone.max_watts.map_or(Value::Null, Value::from),
+            );
+            zone_obj.insert("seconds".to_string(), Value::from(seconds));
+            insert_number(
+                &mut zone_obj,
+                "percent_included",
+                percent(seconds, included_seconds),
+            );
+            zone_obj.insert(
+                "response".to_string(),
+                power_zone_response(
+                    watts,
+                    heartrate,
+                    cadence,
+                    torque,
+                    response_indexes,
+                    min_response_seconds,
+                ),
+            );
+            Value::Object(zone_obj)
+        })
+        .collect();
+
+    let mut result = Map::new();
+    result.insert(
+        "activity_id".to_string(),
+        Value::String(activity_id.to_string()),
+    );
+    result.insert("zone_type".to_string(), Value::String("power".to_string()));
+    result.insert(
+        "zone_model".to_string(),
+        Value::String("activity_power_zones".to_string()),
+    );
+    insert_number(&mut result, "effective_ftp", effective_ftp);
+    result.insert(
+        "total_elapsed_seconds".to_string(),
+        Value::from(total_elapsed_seconds),
+    );
+    result.insert(
+        "included_seconds".to_string(),
+        Value::from(included_seconds),
+    );
+    result.insert(
+        "excluded_seconds".to_string(),
+        Value::from(excluded_seconds),
+    );
+    result.insert(
+        "min_response_seconds".to_string(),
+        Value::from(min_response_seconds),
+    );
+    result.insert("zones".to_string(), Value::Array(zone_values));
+
+    Ok(Value::Object(result))
+}
+
+fn extract_effective_ftp(details: &Value) -> Option<f64> {
+    let obj = details.as_object()?;
+    number_field(obj, &["icu_ftp", "effective_ftp", "ftp", "indoor_ftp"])
+}
+
+fn extract_power_zone_bounds(details: &Value) -> Option<Vec<f64>> {
+    let obj = details.as_object()?;
+    for key in ["icu_power_zones", "power_zones"] {
+        if let Some(bounds) = obj.get(key).and_then(Value::as_array) {
+            let values: Vec<f64> = bounds.iter().filter_map(numeric_value).collect();
+            if !values.is_empty() {
+                return Some(values);
+            }
+        }
+    }
+    None
+}
+
+fn build_power_zone_definitions(
+    details: &Value,
+    effective_ftp: f64,
+    zone_bounds: &[f64],
+) -> Vec<PowerZoneDefinition> {
+    let labels = power_zone_labels(details, zone_bounds.len());
+
+    zone_bounds
+        .iter()
+        .enumerate()
+        .map(|(index, max_percent)| {
+            let min_percent = if index == 0 {
+                0.0
+            } else {
+                zone_bounds[index - 1] + 1.0
+            };
+            PowerZoneDefinition {
+                index,
+                zone: format!("Z{}", index + 1),
+                label: labels
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Z{}", index + 1)),
+                min_percent_ftp: min_percent,
+                max_percent_ftp: *max_percent,
+                min_watts: if index == 0 {
+                    0
+                } else {
+                    watts_for_percent(effective_ftp, min_percent)
+                },
+                max_watts: if *max_percent >= 999.0 {
+                    None
+                } else {
+                    Some(watts_for_percent(effective_ftp, *max_percent))
+                },
+            }
+        })
+        .collect()
+}
+
+fn power_zone_labels(details: &Value, zone_count: usize) -> Vec<String> {
+    const DEFAULT_LABELS: [&str; 7] = [
+        "Active Recovery",
+        "Endurance",
+        "Tempo",
+        "Sweet Spot",
+        "Threshold",
+        "VO2Max",
+        "Anaerobic Capacity",
+    ];
+
+    let labels = details
+        .as_object()
+        .and_then(|obj| {
+            obj.get("icu_power_zone_names")
+                .or_else(|| obj.get("power_zone_names"))
+        })
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if labels.len() >= zone_count {
+        return labels;
+    }
+
+    (0..zone_count)
+        .map(|index| {
+            labels.get(index).cloned().unwrap_or_else(|| {
+                DEFAULT_LABELS
+                    .get(index)
+                    .unwrap_or(&"Power Zone")
+                    .to_string()
+            })
+        })
+        .collect()
+}
+
+fn extract_zone_times(details: &Value) -> HashMap<String, usize> {
+    let mut times = HashMap::new();
+    let Some(obj) = details.as_object() else {
+        return times;
+    };
+
+    for key in ["icu_zone_times", "zone_times"] {
+        let Some(items) = obj.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            let Some(zone_obj) = item.as_object() else {
+                continue;
+            };
+            let Some(zone) = zone_name_from_value(
+                zone_obj
+                    .get("id")
+                    .or_else(|| zone_obj.get("zone"))
+                    .or_else(|| zone_obj.get("name")),
+            ) else {
+                continue;
+            };
+            let Some(seconds) = number_field(zone_obj, &["secs", "seconds"]) else {
+                continue;
+            };
+            times.insert(zone, seconds.round().max(0.0) as usize);
+        }
+        if !times.is_empty() {
+            break;
+        }
+    }
+
+    times
+}
+
+fn zone_name_from_value(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(zone) => Some(zone.to_string()),
+        Value::Number(number) => number.as_u64().map(|n| format!("Z{n}")),
+        _ => None,
+    }
+}
+
+fn stream_data<'a>(value: &'a Value, stream: &str) -> Option<&'a Vec<Value>> {
+    match value {
+        Value::Array(streams) if is_stream_list(streams) => streams
+            .iter()
+            .filter_map(Value::as_object)
+            .find(|obj| {
+                canonical_stream_name(stream_type_from_object(obj))
+                    .eq_ignore_ascii_case(canonical_stream_name(stream))
+            })
+            .and_then(|obj| obj.get("data").and_then(Value::as_array)),
+        Value::Object(obj) => {
+            if let Some(streams) = obj.get("streams")
+                && let Some(data) = stream_data(streams, stream)
+            {
+                return Some(data);
+            }
+
+            obj.iter()
+                .find(|(key, _)| {
+                    canonical_stream_name(key).eq_ignore_ascii_case(canonical_stream_name(stream))
+                })
+                .and_then(|(_, value)| value.as_array())
+        }
+        _ => None,
+    }
+}
+
+fn zone_index_for_watts(watts: f64, effective_ftp: f64, zone_bounds: &[f64]) -> usize {
+    let percent_ftp = watts / effective_ftp * 100.0;
+    zone_bounds
+        .iter()
+        .position(|bound| percent_ftp <= *bound)
+        .unwrap_or_else(|| zone_bounds.len().saturating_sub(1))
+}
+
+fn total_elapsed_seconds(
+    details: &Value,
+    time: Option<&Vec<Value>>,
+    fallback_samples: usize,
+) -> usize {
+    if let Some(time) = time {
+        return time.len();
+    }
+
+    details
+        .as_object()
+        .and_then(|obj| number_field(obj, &["elapsed_time", "total_elapsed_time", "moving_time"]))
+        .map(|seconds| seconds.round().max(0.0) as usize)
+        .unwrap_or(fallback_samples)
+}
+
+fn power_zone_response(
+    watts: &[Value],
+    heartrate: Option<&Vec<Value>>,
+    cadence: Option<&Vec<Value>>,
+    torque: Option<&Vec<Value>>,
+    indexes: &[usize],
+    min_response_seconds: usize,
+) -> Value {
+    let response_seconds = indexes.len();
+    let mut response = Map::new();
+    response.insert(
+        "valid".to_string(),
+        Value::from(response_seconds >= min_response_seconds),
+    );
+    response.insert("seconds".to_string(), Value::from(response_seconds));
+
+    if response_seconds < min_response_seconds {
+        response.insert(
+            "reason".to_string(),
+            Value::String("below_min_response_seconds".to_string()),
+        );
+        return Value::Object(response);
+    }
+
+    if let Some(stats) = power_response_stats(&collect_stream_values(Some(watts), indexes)) {
+        response.insert("power".to_string(), Value::Object(stats));
+    }
+    if let Some(stats) = heartrate_response_stats(&collect_stream_values(
+        heartrate.map(Vec::as_slice),
+        indexes,
+    )) {
+        response.insert("heartrate".to_string(), Value::Object(stats));
+    }
+    if let Some(stats) =
+        cadence_response_stats(&collect_stream_values(cadence.map(Vec::as_slice), indexes))
+    {
+        response.insert("cadence".to_string(), Value::Object(stats));
+    }
+    if let Some(stats) =
+        torque_response_stats(&collect_stream_values(torque.map(Vec::as_slice), indexes))
+    {
+        response.insert("torque".to_string(), Value::Object(stats));
+    }
+
+    Value::Object(response)
+}
+
+fn collect_stream_values(stream: Option<&[Value]>, indexes: &[usize]) -> Vec<f64> {
+    let Some(stream) = stream else {
+        return Vec::new();
+    };
+    indexes
+        .iter()
+        .filter_map(|index| stream.get(*index).and_then(numeric_value))
+        .collect()
+}
+
+fn power_response_stats(values: &[f64]) -> Option<Map<String, Value>> {
+    let mut stats = Map::new();
+    insert_number(&mut stats, "avg", average(values)?);
+    insert_number(&mut stats, "p50", percentile(values, 50)?);
+    Some(stats)
+}
+
+fn heartrate_response_stats(values: &[f64]) -> Option<Map<String, Value>> {
+    let mut stats = Map::new();
+    insert_number(&mut stats, "avg", average(values)?);
+    insert_number(&mut stats, "p90", percentile(values, 90)?);
+    Some(stats)
+}
+
+fn cadence_response_stats(values: &[f64]) -> Option<Map<String, Value>> {
+    let mut stats = Map::new();
+    insert_number(&mut stats, "avg", average(values)?);
+    insert_number(&mut stats, "min", min_value(values)?);
+    Some(stats)
+}
+
+fn torque_response_stats(values: &[f64]) -> Option<Map<String, Value>> {
+    let mut stats = Map::new();
+    insert_number(&mut stats, "avg", average(values)?);
+    insert_number(&mut stats, "max", max_value(values)?);
+    Some(stats)
+}
+
+fn average(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    Some(values.iter().sum::<f64>() / values.len() as f64)
+}
+
+fn min_value(values: &[f64]) -> Option<f64> {
+    values.iter().copied().reduce(f64::min)
+}
+
+fn max_value(values: &[f64]) -> Option<f64> {
+    values.iter().copied().reduce(f64::max)
+}
+
+fn percentile(values: &[f64], percentile: usize) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let index = sorted.len() * percentile / 100;
+    sorted.get(index.min(sorted.len() - 1)).copied()
+}
+
+fn watts_for_percent(effective_ftp: f64, percent: f64) -> i64 {
+    (effective_ftp * percent / 100.0).round() as i64
+}
+
+fn percent(seconds: usize, total_seconds: usize) -> f64 {
+    if total_seconds == 0 {
+        return 0.0;
+    }
+    seconds as f64 / total_seconds as f64 * 100.0
+}
+
+fn insert_number(target: &mut Map<String, Value>, key: &str, value: f64) {
+    let rounded = round_to(value, 2);
+    if (rounded.fract()).abs() < f64::EPSILON {
+        target.insert(key.to_string(), Value::from(rounded as i64));
+    } else {
+        target.insert(key.to_string(), Value::from(rounded));
+    }
+}
+
+fn numeric_value(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|number| number as f64))
+        .or_else(|| value.as_u64().map(|number| number as f64))
+}
+
 pub fn downsample_array(arr: &[Value], target: usize) -> Vec<Value> {
     let len = arr.len();
     if len <= target || target < 2 {
@@ -1159,6 +1629,79 @@ mod tests {
         assert_eq!(stats["min"], 1.0);
         assert_eq!(stats["max"], 3.0);
         assert_eq!(stats["avg"], 2.0);
+    }
+
+    #[test]
+    fn activity_power_zone_stats_combines_distribution_and_response() {
+        let details = serde_json::json!({
+            "id": "i1",
+            "icu_ftp": 100,
+            "elapsed_time": 5,
+            "icu_power_zones": [54, 75, 87, 94, 105],
+            "icu_zone_times": [
+                {"id": "Z1", "secs": 2},
+                {"id": "Z5", "secs": 1}
+            ]
+        });
+        let streams = serde_json::json!({
+            "streams": [
+                {"type": "time", "data": [0, 1, 2, 3, 4]},
+                {"type": "watts", "data": [50, 50, 100, 100, 100]},
+                {"type": "heartrate", "data": [100, 102, 150, 160, 170]},
+                {"type": "cadence", "data": [80, 82, 90, 91, 92]},
+                {"type": "torque", "data": [10, 11, 30, 31, 32]}
+            ]
+        });
+
+        let out = activity_power_zone_stats("i1", &details, &streams, 2).unwrap();
+        assert_eq!(out["activity_id"], "i1");
+        assert_eq!(out["effective_ftp"], 100);
+        assert_eq!(out["total_elapsed_seconds"], 5);
+        assert_eq!(out["included_seconds"], 3);
+        assert_eq!(out["excluded_seconds"], 2);
+
+        let zones = out["zones"].as_array().unwrap();
+        let z5 = zones.iter().find(|zone| zone["zone"] == "Z5").unwrap();
+        assert_eq!(z5["label"], "Threshold");
+        assert_eq!(z5["seconds"], 1);
+        assert_eq!(z5["response"]["valid"], true);
+        assert_eq!(z5["response"]["seconds"], 3);
+        assert_eq!(z5["response"]["power"]["avg"], 100);
+        assert_eq!(z5["response"]["heartrate"]["p90"], 170);
+        assert_eq!(z5["response"]["cadence"]["min"], 90);
+        assert_eq!(z5["response"]["torque"]["max"], 32);
+        assert!(z5["response"].get("first_half").is_none());
+        assert!(z5["response"].get("second_half").is_none());
+    }
+
+    #[test]
+    fn activity_power_zone_stats_marks_short_response_invalid() {
+        let details = serde_json::json!({
+            "id": "i1",
+            "icu_ftp": 100,
+            "icu_power_zones": [54, 75, 87, 94, 105],
+            "icu_zone_times": [
+                {"id": "Z5", "secs": 3}
+            ]
+        });
+        let streams = serde_json::json!({
+            "time": [0, 1, 2],
+            "watts": [100, 100, 100],
+            "heartrate": [150, 160, 170]
+        });
+
+        let out = activity_power_zone_stats("i1", &details, &streams, 4).unwrap();
+        let z5 = out["zones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|zone| zone["zone"] == "Z5")
+            .unwrap();
+
+        assert_eq!(z5["response"]["valid"], false);
+        assert_eq!(z5["response"]["reason"], "below_min_response_seconds");
+        assert_eq!(z5["response"]["seconds"], 3);
+        assert!(z5["response"].get("power").is_none());
     }
 
     #[test]
