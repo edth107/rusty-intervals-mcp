@@ -167,7 +167,7 @@ fn transform_stream_object_with_window(
         .ok_or_else(|| "window requires a time stream, but none was returned".to_string())?;
     let indices = window.indices_for(time_data);
     let mut result = Map::new();
-    result.insert("window".to_string(), window.metadata(&indices));
+    result.insert("window".to_string(), window.metadata(&indices, time_data));
 
     for (key, val) in obj {
         if !stream_matches_filter(&key, filter_streams) {
@@ -248,7 +248,7 @@ fn transform_stream_list_with_window(
 
     let indices = window.indices_for(time_data);
     let mut result = Map::new();
-    result.insert("window".to_string(), window.metadata(&indices));
+    result.insert("window".to_string(), window.metadata(&indices, time_data));
 
     for stream in streams {
         let Some(obj) = stream.as_object() else {
@@ -282,9 +282,22 @@ fn is_stream_list(streams: &[Value]) -> bool {
 }
 
 fn stream_matches_filter(stream_type: &str, filter_streams: Option<&[String]>) -> bool {
+    let canonical_stream_type = canonical_stream_name(stream_type);
     filter_streams
-        .map(|filter| filter.iter().any(|f| f.eq_ignore_ascii_case(stream_type)))
+        .map(|filter| {
+            filter
+                .iter()
+                .any(|f| canonical_stream_name(f).eq_ignore_ascii_case(canonical_stream_type))
+        })
         .unwrap_or(true)
+}
+
+fn canonical_stream_name(stream: &str) -> &str {
+    if stream.eq_ignore_ascii_case("power") {
+        "watts"
+    } else {
+        stream
+    }
 }
 
 fn stream_type_from_object(obj: &Map<String, Value>) -> &str {
@@ -364,13 +377,27 @@ impl ElapsedWindow {
         }
     }
 
-    fn metadata(&self, indices: &WindowIndices) -> Value {
+    fn metadata(&self, indices: &WindowIndices, time_data: &[Value]) -> Value {
+        let first_available_seconds = first_available_seconds(time_data);
+        let last_available_seconds = last_available_seconds(time_data);
+        let actual_start_seconds = seconds_at_index(time_data, indices.start_index);
+        let actual_end_seconds =
+            seconds_at_index(time_data, indices.end_index).or(last_available_seconds);
+        let clamped_start = first_available_seconds.is_some_and(|first| self.start_seconds < first)
+            || (actual_start_seconds.is_none() && indices.start_index >= time_data.len());
+        let clamped_end = last_available_seconds.is_some_and(|last| self.end_seconds > last);
+
         serde_json::json!({
             "type": "elapsed_time",
             "requested_start": self.requested_start,
             "requested_end": self.requested_end,
             "start_seconds": self.start_seconds,
             "end_seconds": self.end_seconds,
+            "actual_start_seconds": actual_start_seconds,
+            "actual_end_seconds": actual_end_seconds,
+            "clamped": clamped_start || clamped_end,
+            "clamped_start": clamped_start,
+            "clamped_end": clamped_end,
             "start_index": indices.start_index,
             "end_index": indices.end_index,
             "end_exclusive": true,
@@ -438,6 +465,18 @@ fn value_to_seconds(value: &Value) -> Option<f64> {
     value
         .as_f64()
         .or_else(|| value.as_str().and_then(|s| parse_elapsed_seconds(s).ok()))
+}
+
+fn seconds_at_index(time_data: &[Value], index: usize) -> Option<f64> {
+    time_data.get(index).and_then(value_to_seconds)
+}
+
+fn first_available_seconds(time_data: &[Value]) -> Option<f64> {
+    time_data.iter().find_map(value_to_seconds)
+}
+
+fn last_available_seconds(time_data: &[Value]) -> Option<f64> {
+    time_data.iter().rev().find_map(value_to_seconds)
 }
 
 pub fn compute_stream_stats(arr: &[Value]) -> Value {
@@ -1026,6 +1065,61 @@ mod tests {
         assert_eq!(result["watts"]["count"], 3);
         assert_eq!(result["watts"]["avg"], 300.0);
         assert_eq!(result["watts"]["p90"], 400.0);
+    }
+
+    #[test]
+    fn transform_streams_window_accepts_power_alias_for_watts() {
+        let input = serde_json::json!([
+            {"type": "time", "data": [0, 60, 120]},
+            {"type": "watts", "data": [100, 200, 300]},
+            {"type": "cadence", "data": [80, 81, 82]}
+        ]);
+        let window = StreamWindow {
+            window_type: None,
+            start: "00:00".to_string(),
+            end: "03:00".to_string(),
+        };
+
+        let result = transform_streams_with_window(
+            input,
+            None,
+            true,
+            Some(vec!["power".into()]),
+            Some(&window),
+        )
+        .expect("power alias should match watts");
+
+        assert!(result.get("cadence").is_none());
+        assert_eq!(result["watts"]["count"], 3);
+        assert!(result.get("power").is_none());
+    }
+
+    #[test]
+    fn transform_streams_window_reports_clamped_end() {
+        let input = serde_json::json!([
+            {"type": "time", "data": [0, 60, 120]},
+            {"type": "watts", "data": [100, 200, 300]}
+        ]);
+        let window = StreamWindow {
+            window_type: None,
+            start: "01:00".to_string(),
+            end: "10:00".to_string(),
+        };
+
+        let result = transform_streams_with_window(
+            input,
+            None,
+            false,
+            Some(vec!["watts".into()]),
+            Some(&window),
+        )
+        .expect("out-of-bounds end should clamp");
+
+        assert_eq!(result["window"]["clamped"], true);
+        assert_eq!(result["window"]["clamped_end"], true);
+        assert_eq!(result["window"]["actual_start_seconds"], 60.0);
+        assert_eq!(result["window"]["actual_end_seconds"], 120.0);
+        assert_eq!(result["watts"], serde_json::json!([200, 300]));
     }
 
     #[test]

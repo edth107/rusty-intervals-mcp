@@ -337,9 +337,10 @@ pub struct StreamsParams {
     pub activity_id: String,
     /// Maximum number of data points per stream. If set, arrays are downsampled.
     pub max_points: Option<u32>,
-    /// Return summary statistics (min/max/avg/count) instead of raw arrays.
+    /// Return summary statistics instead of raw arrays. Default: true.
     pub summary: Option<bool>,
-    /// Specific streams to return (e.g., ["power", "heartrate"]). Default: all available.
+    /// Specific streams to return (e.g., ["watts", "heartrate"]). Default: all available.
+    /// Alias: "power" is accepted and mapped to "watts".
     pub streams: Option<Vec<String>>,
     /// Optional elapsed-time window to slice streams before summary/downsampling.
     pub window: Option<StreamWindow>,

@@ -451,14 +451,14 @@ impl IntervalsMcpHandler {
 
     #[tool(
         name = "get_activity_streams",
-        description = "Get activity streams. Params: activity_id, max_points (downsample), summary (stats only), streams (filter), window ({type: elapsed_time, start, end})."
+        description = "Get activity streams. Params: activity_id, max_points (downsample), summary (default true stats), streams (e.g. watts; power aliases to watts), window ({type: elapsed_time, start, end})."
     )]
     async fn get_activity_streams(
         &self,
         params: Parameters<StreamsParams>,
     ) -> Result<Json<ObjectResult>, String> {
         let p = params.0;
-        let stream_filter = p.streams.clone();
+        let stream_filter = Self::normalize_stream_filter(p.streams.clone());
         let api_stream_filter =
             Self::stream_filter_for_api(stream_filter.clone(), p.window.is_some());
         let v = self
@@ -514,6 +514,8 @@ impl IntervalsMcpHandler {
         stream_filter: Option<Vec<String>>,
         needs_time_stream: bool,
     ) -> Option<Vec<String>> {
+        let stream_filter = Self::normalize_stream_filter(stream_filter);
+
         if !needs_time_stream {
             return stream_filter;
         }
@@ -530,6 +532,23 @@ impl IntervalsMcpHandler {
         }
 
         Some(streams)
+    }
+
+    fn normalize_stream_filter(stream_filter: Option<Vec<String>>) -> Option<Vec<String>> {
+        stream_filter.map(|streams| {
+            streams
+                .into_iter()
+                .map(|stream| Self::canonical_stream_name(&stream).to_string())
+                .collect()
+        })
+    }
+
+    fn canonical_stream_name(stream: &str) -> &str {
+        if stream.eq_ignore_ascii_case("power") {
+            "watts"
+        } else {
+            stream
+        }
     }
 
     #[tool(
@@ -6741,6 +6760,19 @@ mod tests {
 
         let unbounded = IntervalsMcpHandler::stream_filter_for_api(None, true);
         assert!(unbounded.is_none());
+    }
+
+    #[test]
+    fn stream_filter_for_api_maps_power_alias_to_watts() {
+        let api_filter = IntervalsMcpHandler::stream_filter_for_api(
+            Some(vec!["power".into(), "heartrate".into()]),
+            false,
+        )
+        .expect("filter should remain bounded");
+
+        assert!(api_filter.iter().any(|stream| stream == "watts"));
+        assert!(api_filter.iter().any(|stream| stream == "heartrate"));
+        assert!(!api_filter.iter().any(|stream| stream == "power"));
     }
 
     #[tokio::test]

@@ -433,12 +433,13 @@ Several tools support **compact mode** to reduce token usage:
 |-----------|------|-------------|
 | `activity_id` | string | Activity ID (required) |
 | `max_points` | integer | Downsample arrays to this size (e.g., 100) |
-| `summary` | boolean | Return stats (min/max/avg/p10/p50/p90) instead of arrays |
-| `streams` | array | Filter to specific streams (e.g., `["power", "heartrate"]`) |
+| `summary` | boolean | Return stats (min/max/avg/p10/p50/p90) instead of arrays (default: true) |
+| `streams` | array | Filter to specific streams (e.g., `["watts", "heartrate"]`; `power` aliases to `watts`) |
+| `window` | object | Optional elapsed-time slice before summary/downsampling: `{ "start": "42:30", "end": "47:30", "type": "elapsed_time" }` |
 
 **Example - Summary mode (saves ~95% tokens for long activities):**
 ```json
-{"activity_id": "i123", "summary": true, "streams": ["power"]}
+{"activity_id": "i123", "streams": ["watts"], "window": {"start": "42:30", "end": "47:30"}}
 ```
 
 #### `get_activity_details`
@@ -461,8 +462,8 @@ Several tools support **compact mode** to reduce token usage:
 ### Best Practices for Token Efficiency
 
 1. **Start with compact** - Use default (compact) responses first, expand only when needed
-2. **Filter streams** - Request only the streams you need (e.g., just `power` and `heartrate`)
-3. **Use summary for analysis** - For trend analysis, use `summary: true` to get statistics without raw data
+2. **Filter streams** - Request only the streams you need (e.g., just `watts` and `heartrate`)
+3. **Use summary for analysis** - Default `summary: true` returns statistics without raw arrays
 4. **Limit recent activities** - Use `limit` parameter to control result count
 5. **Use specific fields** - Request only the fields you need with `fields` parameter
 
@@ -839,4 +840,3 @@ MIT License - see [LICENSE](LICENSE) file for details
 ## Disclaimer
 
 This project is not affiliated with, endorsed by, or sponsored by Intervals.icu. All product names, logos, and brands are property of their respective owners.
-
