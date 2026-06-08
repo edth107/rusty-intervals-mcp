@@ -553,7 +553,7 @@ impl IntervalsMcpHandler {
 
     #[tool(
         name = "get_activity_intervals",
-        description = "Get workout intervals. Params: activity_id, summary (default true), max_intervals (default 100), fields (extra raw fields). summary=false returns compact intervals with window objects."
+        description = "Get workout intervals. Params: activity_id, summary (default true), max_intervals (default 100), fields (extra raw fields). summary=false returns count metadata and window intervals."
     )]
     async fn get_activity_intervals(
         &self,
@@ -6990,7 +6990,8 @@ mod tests {
 
         let result = IntervalsMcpHandler::transform_intervals(&input, true, 100, None);
 
-        assert_eq!(result.get("count").and_then(|v| v.as_u64()), Some(3));
+        assert_eq!(result.get("total_count").and_then(|v| v.as_u64()), Some(3));
+        assert_eq!(result["zone_type"], "power");
         assert!(result.get("types").is_some());
         assert_eq!(result["work_count"], 2);
         assert_eq!(result["recovery_count"], 1);
@@ -7033,7 +7034,9 @@ mod tests {
 
         assert_eq!(result["activity_id"], "i1");
         assert_eq!(result["source"], "icu_intervals");
-        assert_eq!(result["count"], 2);
+        assert_eq!(result["zone_type"], "power");
+        assert_eq!(result["total_count"], 2);
+        assert_eq!(result["returned_count"], 1);
         assert_eq!(result["max_intervals"], 1);
         assert_eq!(result["truncated"], true);
         assert_eq!(intervals.len(), 1);
@@ -7043,6 +7046,7 @@ mod tests {
         assert_eq!(intervals[0]["end_seconds"], 1230.0);
         assert_eq!(intervals[0]["window"]["start"], "19:30");
         assert_eq!(intervals[0]["window"]["end"], "20:30");
+        assert_eq!(intervals[0]["window"]["end_exclusive"], true);
         assert_eq!(intervals[0]["stats"]["average_watts"], 260);
         assert!(intervals[0].get("joules").is_none());
     }
@@ -7077,7 +7081,8 @@ mod tests {
             .0
             .value;
 
-        assert_eq!(res["count"], 1);
+        assert_eq!(res["total_count"], 1);
+        assert_eq!(res["zone_type"], "power");
         assert_eq!(res["source"], "intervals");
         assert!(res.get("intervals").is_none());
     }

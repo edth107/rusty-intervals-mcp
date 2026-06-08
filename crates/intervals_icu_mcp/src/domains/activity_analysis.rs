@@ -581,8 +581,9 @@ pub fn transform_intervals(
         }
 
         let mut summary = serde_json::json!({
-            "count": total,
+            "total_count": total,
             "source": source,
+            "zone_type": "power",
             "types": type_counts,
             "zones": zone_counts,
             "work_count": work_count,
@@ -620,7 +621,9 @@ pub fn transform_intervals(
         );
     }
     result.insert("source".to_string(), Value::String(source.to_string()));
-    result.insert("count".to_string(), Value::from(arr.len()));
+    result.insert("zone_type".to_string(), Value::String("power".to_string()));
+    result.insert("total_count".to_string(), Value::from(arr.len()));
+    result.insert("returned_count".to_string(), Value::from(limited.len()));
     result.insert("max_intervals".to_string(), Value::from(max_intervals));
     result.insert(
         "truncated".to_string(),
@@ -698,7 +701,8 @@ fn interval_window(obj: &Map<String, Value>) -> Option<Value> {
     Some(serde_json::json!({
         "type": "elapsed_time",
         "start": format_elapsed_time(start_seconds),
-        "end": format_elapsed_time(end_seconds)
+        "end": format_elapsed_time(end_seconds),
+        "end_exclusive": true
     }))
 }
 

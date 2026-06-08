@@ -450,7 +450,7 @@ Several tools support **compact mode** to reduce token usage:
 | `max_intervals` | integer | Limit returned intervals when `summary=false` (default: 100) |
 | `fields` | array | Extra raw interval fields to include; default stays compact |
 
-With `summary=false`, returns `intervals[]` containing API zones, timing, a `window` object for `get_activity_streams`, and compact stats.
+With `summary=false`, returns `total_count`, `returned_count`, `zone_type`, and `intervals[]` containing API zones, timing, a `window` object for `get_activity_streams`, and compact stats. Interval windows are elapsed-time and end-exclusive.
 
 **Example - Window-ready intervals:**
 ```json
