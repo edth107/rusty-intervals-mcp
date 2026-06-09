@@ -463,7 +463,7 @@ With `summary=false`, returns `total_count`, `returned_count`, `zone_type`, and 
 | `activity_id` | string | Activity ID (required) |
 | `min_response_seconds` | integer | Minimum seconds before response stats are valid (default: 30) |
 
-Returns activity power-zone distribution plus per-zone response stats. Each zone includes FTP-derived bounds, seconds, percent included, and `response` with `valid`, `seconds`, power, heartrate, cadence, and torque stats. Short zones return `response.valid=false` with `reason="below_min_response_seconds"`.
+Returns activity power-zone distribution plus per-zone response stats. Each zone includes FTP-derived bounds, seconds, percent included, and `response` with `valid`, `seconds`, power, heartrate, cadence, and torque stats. Zone seconds and response seconds use the same included samples; stopped samples are excluded when a movement stream is available. Short zones return `response.valid=false` with `reason="below_min_response_seconds"`.
 
 **Example - Power zone response:**
 ```json

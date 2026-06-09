@@ -547,12 +547,19 @@ pub fn activity_power_zone_stats(
     let heartrate = stream_data(streams, "heartrate");
     let cadence = stream_data(streams, "cadence");
     let torque = stream_data(streams, "torque");
+    let velocity_smooth = stream_data(streams, "velocity_smooth");
 
     let zones = build_power_zone_definitions(details, effective_ftp, &zone_bounds);
-    let zone_times = extract_zone_times(details);
+    let include_mask = included_power_zone_sample_mask(details, watts.len(), velocity_smooth);
     let mut indexes_by_zone: Vec<Vec<usize>> = vec![Vec::new(); zones.len()];
 
     for (index, value) in watts.iter().enumerate() {
+        if let Some(mask) = &include_mask
+            && !mask.get(index).copied().unwrap_or(false)
+        {
+            continue;
+        }
+
         let Some(watts_value) = numeric_value(value) else {
             continue;
         };
@@ -563,17 +570,7 @@ pub fn activity_power_zone_stats(
     }
 
     let total_elapsed_seconds = total_elapsed_seconds(details, time, watts.len());
-    let classified_seconds: usize = indexes_by_zone.iter().map(Vec::len).sum();
-    let included_seconds =
-        zone_times
-            .values()
-            .copied()
-            .sum::<usize>()
-            .max(if zone_times.is_empty() {
-                classified_seconds
-            } else {
-                0
-            });
+    let included_seconds: usize = indexes_by_zone.iter().map(Vec::len).sum();
     let excluded_seconds = total_elapsed_seconds.saturating_sub(included_seconds);
 
     let zone_values: Vec<Value> = zones
@@ -583,10 +580,7 @@ pub fn activity_power_zone_stats(
                 .get(zone.index)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let seconds = zone_times
-                .get(&zone.zone)
-                .copied()
-                .unwrap_or(response_indexes.len());
+            let seconds = response_indexes.len();
             let mut zone_obj = Map::new();
             zone_obj.insert("zone".to_string(), Value::String(zone.zone.clone()));
             zone_obj.insert("label".to_string(), Value::String(zone.label.clone()));
@@ -648,6 +642,47 @@ pub fn activity_power_zone_stats(
     result.insert("zones".to_string(), Value::Array(zone_values));
 
     Ok(Value::Object(result))
+}
+
+fn included_power_zone_sample_mask(
+    details: &Value,
+    sample_count: usize,
+    velocity_smooth: Option<&Vec<Value>>,
+) -> Option<Vec<bool>> {
+    let velocity_smooth = velocity_smooth?;
+    let mut mask = vec![false; sample_count];
+    let mut included_samples = 0usize;
+
+    for (index, included) in mask.iter_mut().enumerate() {
+        if velocity_smooth.get(index).and_then(numeric_value).is_some() {
+            *included = true;
+            included_samples += 1;
+        }
+    }
+
+    if included_samples == 0 || included_samples == sample_count {
+        return None;
+    }
+
+    if let Some(moving_time) = moving_time_seconds(details) {
+        if seconds_close(included_samples, moving_time) {
+            return Some(mask);
+        }
+        return None;
+    }
+
+    Some(mask)
+}
+
+fn moving_time_seconds(details: &Value) -> Option<usize> {
+    details
+        .as_object()
+        .and_then(|obj| number_field(obj, &["moving_time"]))
+        .map(|seconds| seconds.round().max(0.0) as usize)
+}
+
+fn seconds_close(a: usize, b: usize) -> bool {
+    a.abs_diff(b) <= 1
 }
 
 fn extract_effective_ftp(details: &Value) -> Option<f64> {
@@ -749,49 +784,6 @@ fn power_zone_labels(details: &Value, zone_count: usize) -> Vec<String> {
             })
         })
         .collect()
-}
-
-fn extract_zone_times(details: &Value) -> HashMap<String, usize> {
-    let mut times = HashMap::new();
-    let Some(obj) = details.as_object() else {
-        return times;
-    };
-
-    for key in ["icu_zone_times", "zone_times"] {
-        let Some(items) = obj.get(key).and_then(Value::as_array) else {
-            continue;
-        };
-        for item in items {
-            let Some(zone_obj) = item.as_object() else {
-                continue;
-            };
-            let Some(zone) = zone_name_from_value(
-                zone_obj
-                    .get("id")
-                    .or_else(|| zone_obj.get("zone"))
-                    .or_else(|| zone_obj.get("name")),
-            ) else {
-                continue;
-            };
-            let Some(seconds) = number_field(zone_obj, &["secs", "seconds"]) else {
-                continue;
-            };
-            times.insert(zone, seconds.round().max(0.0) as usize);
-        }
-        if !times.is_empty() {
-            break;
-        }
-    }
-
-    times
-}
-
-fn zone_name_from_value(value: Option<&Value>) -> Option<String> {
-    match value? {
-        Value::String(zone) => Some(zone.to_string()),
-        Value::Number(number) => number.as_u64().map(|n| format!("Z{n}")),
-        _ => None,
-    }
 }
 
 fn stream_data<'a>(value: &'a Value, stream: &str) -> Option<&'a Vec<Value>> {
@@ -1637,6 +1629,7 @@ mod tests {
             "id": "i1",
             "icu_ftp": 100,
             "elapsed_time": 5,
+            "moving_time": 3,
             "icu_power_zones": [54, 75, 87, 94, 105],
             "icu_zone_times": [
                 {"id": "Z1", "secs": 2},
@@ -1649,11 +1642,12 @@ mod tests {
                 {"type": "watts", "data": [50, 50, 100, 100, 100]},
                 {"type": "heartrate", "data": [100, 102, 150, 160, 170]},
                 {"type": "cadence", "data": [80, 82, 90, 91, 92]},
-                {"type": "torque", "data": [10, 11, 30, 31, 32]}
+                {"type": "torque", "data": [10, 11, 30, 31, 32]},
+                {"type": "velocity_smooth", "data": [2.1, 2.2, 2.3, null, null]}
             ]
         });
 
-        let out = activity_power_zone_stats("i1", &details, &streams, 2).unwrap();
+        let out = activity_power_zone_stats("i1", &details, &streams, 1).unwrap();
         assert_eq!(out["activity_id"], "i1");
         assert_eq!(out["effective_ftp"], 100);
         assert_eq!(out["total_elapsed_seconds"], 5);
@@ -1665,11 +1659,21 @@ mod tests {
         assert_eq!(z5["label"], "Threshold");
         assert_eq!(z5["seconds"], 1);
         assert_eq!(z5["response"]["valid"], true);
-        assert_eq!(z5["response"]["seconds"], 3);
+        assert_eq!(z5["response"]["seconds"], 1);
         assert_eq!(z5["response"]["power"]["avg"], 100);
-        assert_eq!(z5["response"]["heartrate"]["p90"], 170);
+        assert_eq!(z5["response"]["heartrate"]["p90"], 150);
         assert_eq!(z5["response"]["cadence"]["min"], 90);
-        assert_eq!(z5["response"]["torque"]["max"], 32);
+        assert_eq!(z5["response"]["torque"]["max"], 30);
+        let zone_seconds: i64 = zones
+            .iter()
+            .map(|zone| zone["seconds"].as_i64().unwrap())
+            .sum();
+        let response_seconds: i64 = zones
+            .iter()
+            .map(|zone| zone["response"]["seconds"].as_i64().unwrap())
+            .sum();
+        assert_eq!(zone_seconds, response_seconds);
+        assert_eq!(zone_seconds, out["included_seconds"].as_i64().unwrap());
         assert!(z5["response"].get("first_half").is_none());
         assert!(z5["response"].get("second_half").is_none());
     }

@@ -575,6 +575,7 @@ impl IntervalsMcpHandler {
                     "heartrate".to_string(),
                     "cadence".to_string(),
                     "torque".to_string(),
+                    "velocity_smooth".to_string(),
                 ]),
             )
             .await
