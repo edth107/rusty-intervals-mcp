@@ -199,6 +199,12 @@ pub struct ActivityPowerZoneStatsParams {
     pub activity_id: String,
     /// Minimum zone seconds before response stats are considered valid (default: 30).
     pub min_response_seconds: Option<u32>,
+    /// Optional Intervals-style inclusive upper power-zone bounds as percent of FTP.
+    /// Must be strictly increasing and end with an open sentinel such as 999.
+    /// Example: [54,75,87,94,105,120,999].
+    pub zone_bounds_percent: Option<Vec<f64>>,
+    /// Optional labels for zone_bounds_percent, in the same order.
+    pub zone_labels: Option<Vec<String>>,
 }
 
 /// Parameters for get_best_efforts with compact mode

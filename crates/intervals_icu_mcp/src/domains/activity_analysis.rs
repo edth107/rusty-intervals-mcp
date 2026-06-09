@@ -523,11 +523,42 @@ struct PowerZoneDefinition {
     max_watts: Option<i64>,
 }
 
+#[derive(Debug, Clone)]
+struct WeightedSample {
+    index: usize,
+    seconds: f64,
+}
+
+#[derive(Debug, Clone)]
+struct WeightedValue {
+    value: f64,
+    seconds: f64,
+}
+
+#[derive(Debug)]
+struct ZoneBounds {
+    values: Vec<f64>,
+    source: &'static str,
+    model: &'static str,
+}
+
+#[derive(Debug)]
+struct IncludeDecision {
+    mask: Option<Vec<bool>>,
+    analysis_time_basis: &'static str,
+    include_filter: &'static str,
+    movement_seconds: Option<f64>,
+    basis_matches_moving_time: Option<bool>,
+    basis_delta_seconds: Option<f64>,
+}
+
 pub fn activity_power_zone_stats(
     activity_id: &str,
     details: &Value,
     streams: &Value,
     min_response_seconds: usize,
+    zone_bounds_override: Option<&[f64]>,
+    zone_labels_override: Option<&[String]>,
 ) -> Result<Value, String> {
     let effective_ftp = extract_effective_ftp(details)
         .ok_or_else(|| "activity power-zone stats require an activity FTP".to_string())?;
@@ -535,11 +566,7 @@ pub fn activity_power_zone_stats(
         return Err("activity power-zone stats require a positive FTP".to_string());
     }
 
-    let zone_bounds = extract_power_zone_bounds(details)
-        .ok_or_else(|| "activity power-zone stats require power-zone bounds".to_string())?;
-    if zone_bounds.is_empty() {
-        return Err("activity power-zone stats require at least one power zone".to_string());
-    }
+    let zone_bounds = resolve_power_zone_bounds(details, zone_bounds_override)?;
 
     let watts = stream_data(streams, "watts")
         .ok_or_else(|| "activity power-zone stats require a watts stream".to_string())?;
@@ -549,38 +576,56 @@ pub fn activity_power_zone_stats(
     let torque = stream_data(streams, "torque");
     let velocity_smooth = stream_data(streams, "velocity_smooth");
 
-    let zones = build_power_zone_definitions(details, effective_ftp, &zone_bounds);
-    let include_mask = included_power_zone_sample_mask(details, watts.len(), velocity_smooth);
-    let mut indexes_by_zone: Vec<Vec<usize>> = vec![Vec::new(); zones.len()];
+    let sample_weights = sample_second_weights(details, time, watts.len());
+    let total_elapsed_seconds = total_elapsed_seconds(details, &sample_weights, watts.len());
+    let include_decision =
+        included_power_zone_sample_mask(details, velocity_smooth, &sample_weights);
+    let zones = build_power_zone_definitions(
+        details,
+        effective_ftp,
+        &zone_bounds.values,
+        zone_labels_override,
+    );
+    let mut samples_by_zone: Vec<Vec<WeightedSample>> = vec![Vec::new(); zones.len()];
 
     for (index, value) in watts.iter().enumerate() {
-        if let Some(mask) = &include_mask
+        if let Some(mask) = &include_decision.mask
             && !mask.get(index).copied().unwrap_or(false)
         {
+            continue;
+        }
+
+        let seconds = sample_weights.get(index).copied().unwrap_or(1.0);
+        if seconds <= 0.0 {
             continue;
         }
 
         let Some(watts_value) = numeric_value(value) else {
             continue;
         };
-        let zone_index = zone_index_for_watts(watts_value, effective_ftp, &zone_bounds);
-        if let Some(indexes) = indexes_by_zone.get_mut(zone_index) {
-            indexes.push(index);
+        let zone_index = zone_index_for_watts(watts_value, effective_ftp, &zone_bounds.values);
+        if let Some(samples) = samples_by_zone.get_mut(zone_index) {
+            samples.push(WeightedSample { index, seconds });
         }
     }
 
-    let total_elapsed_seconds = total_elapsed_seconds(details, time, watts.len());
-    let included_seconds: usize = indexes_by_zone.iter().map(Vec::len).sum();
-    let excluded_seconds = total_elapsed_seconds.saturating_sub(included_seconds);
-
+    let included_seconds_value: f64 = samples_by_zone
+        .iter()
+        .flatten()
+        .map(|sample| sample.seconds)
+        .sum();
+    let included_seconds = rounded_seconds(included_seconds_value);
+    let excluded_seconds =
+        rounded_seconds((total_elapsed_seconds - included_seconds_value).max(0.0));
     let zone_values: Vec<Value> = zones
         .iter()
         .map(|zone| {
-            let response_indexes = indexes_by_zone
+            let response_samples = samples_by_zone
                 .get(zone.index)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let seconds = response_indexes.len();
+            let seconds_value: f64 = response_samples.iter().map(|sample| sample.seconds).sum();
+            let seconds = rounded_seconds(seconds_value);
             let mut zone_obj = Map::new();
             zone_obj.insert("zone".to_string(), Value::String(zone.zone.clone()));
             zone_obj.insert("label".to_string(), Value::String(zone.label.clone()));
@@ -595,7 +640,7 @@ pub fn activity_power_zone_stats(
             insert_number(
                 &mut zone_obj,
                 "percent_included",
-                percent(seconds, included_seconds),
+                percent(seconds_value, included_seconds_value),
             );
             zone_obj.insert(
                 "response".to_string(),
@@ -604,7 +649,7 @@ pub fn activity_power_zone_stats(
                     heartrate,
                     cadence,
                     torque,
-                    response_indexes,
+                    response_samples,
                     min_response_seconds,
                 ),
             );
@@ -620,12 +665,49 @@ pub fn activity_power_zone_stats(
     result.insert("zone_type".to_string(), Value::String("power".to_string()));
     result.insert(
         "zone_model".to_string(),
-        Value::String("activity_power_zones".to_string()),
+        Value::String(zone_bounds.model.to_string()),
+    );
+    result.insert(
+        "zone_source".to_string(),
+        Value::String(zone_bounds.source.to_string()),
     );
     insert_number(&mut result, "effective_ftp", effective_ftp);
     result.insert(
         "total_elapsed_seconds".to_string(),
-        Value::from(total_elapsed_seconds),
+        Value::from(rounded_seconds(total_elapsed_seconds)),
+    );
+    result.insert(
+        "moving_time_seconds".to_string(),
+        moving_time_seconds(details)
+            .map_or(Value::Null, |seconds| Value::from(rounded_seconds(seconds))),
+    );
+    result.insert(
+        "analysis_time_basis".to_string(),
+        Value::String(include_decision.analysis_time_basis.to_string()),
+    );
+    result.insert(
+        "include_filter".to_string(),
+        Value::String(include_decision.include_filter.to_string()),
+    );
+    result.insert(
+        "basis_matches_moving_time".to_string(),
+        include_decision
+            .basis_matches_moving_time
+            .map_or(Value::Null, Value::from),
+    );
+    result.insert(
+        "basis_delta_seconds".to_string(),
+        include_decision
+            .basis_delta_seconds
+            .map_or(Value::Null, |seconds| {
+                Value::from(rounded_seconds_signed(seconds))
+            }),
+    );
+    result.insert(
+        "movement_seconds".to_string(),
+        include_decision
+            .movement_seconds
+            .map_or(Value::Null, |seconds| Value::from(rounded_seconds(seconds))),
     );
     result.insert(
         "included_seconds".to_string(),
@@ -646,43 +728,88 @@ pub fn activity_power_zone_stats(
 
 fn included_power_zone_sample_mask(
     details: &Value,
-    sample_count: usize,
     velocity_smooth: Option<&Vec<Value>>,
-) -> Option<Vec<bool>> {
-    let velocity_smooth = velocity_smooth?;
-    let mut mask = vec![false; sample_count];
-    let mut included_samples = 0usize;
+    sample_weights: &[f64],
+) -> IncludeDecision {
+    let Some(velocity_smooth) = velocity_smooth else {
+        return IncludeDecision {
+            mask: None,
+            analysis_time_basis: "elapsed_stream_samples",
+            include_filter: "none",
+            movement_seconds: None,
+            basis_matches_moving_time: moving_time_seconds(details).map(|_| false),
+            basis_delta_seconds: None,
+        };
+    };
+
+    let mut mask = vec![false; sample_weights.len()];
+    let mut movement_seconds = 0.0;
 
     for (index, included) in mask.iter_mut().enumerate() {
-        if velocity_smooth.get(index).and_then(numeric_value).is_some() {
+        if velocity_smooth
+            .get(index)
+            .and_then(numeric_value)
+            .is_some_and(|speed| speed > 0.0)
+        {
             *included = true;
-            included_samples += 1;
+            movement_seconds += sample_weights.get(index).copied().unwrap_or(0.0);
         }
     }
 
-    if included_samples == 0 || included_samples == sample_count {
-        return None;
-    }
-
+    let stream_seconds: f64 = sample_weights.iter().sum();
     if let Some(moving_time) = moving_time_seconds(details) {
-        if seconds_close(included_samples, moving_time) {
-            return Some(mask);
+        let delta = movement_seconds - moving_time;
+        let matches = seconds_close(movement_seconds, moving_time);
+        if movement_seconds > 0.0 && movement_seconds < stream_seconds && matches {
+            return IncludeDecision {
+                mask: Some(mask),
+                analysis_time_basis: "moving_time",
+                include_filter: "velocity_smooth_gt_0",
+                movement_seconds: Some(movement_seconds),
+                basis_matches_moving_time: Some(true),
+                basis_delta_seconds: Some(delta),
+            };
         }
-        return None;
+        return IncludeDecision {
+            mask: None,
+            analysis_time_basis: "elapsed_stream_samples",
+            include_filter: "none",
+            movement_seconds: Some(movement_seconds),
+            basis_matches_moving_time: Some(matches),
+            basis_delta_seconds: Some(delta),
+        };
     }
 
-    Some(mask)
+    if movement_seconds > 0.0 && movement_seconds < stream_seconds {
+        return IncludeDecision {
+            mask: Some(mask),
+            analysis_time_basis: "movement_stream",
+            include_filter: "velocity_smooth_gt_0",
+            movement_seconds: Some(movement_seconds),
+            basis_matches_moving_time: None,
+            basis_delta_seconds: None,
+        };
+    }
+
+    IncludeDecision {
+        mask: None,
+        analysis_time_basis: "elapsed_stream_samples",
+        include_filter: "none",
+        movement_seconds: Some(movement_seconds),
+        basis_matches_moving_time: None,
+        basis_delta_seconds: None,
+    }
 }
 
-fn moving_time_seconds(details: &Value) -> Option<usize> {
+fn moving_time_seconds(details: &Value) -> Option<f64> {
     details
         .as_object()
         .and_then(|obj| number_field(obj, &["moving_time"]))
-        .map(|seconds| seconds.round().max(0.0) as usize)
+        .map(|seconds| seconds.max(0.0))
 }
 
-fn seconds_close(a: usize, b: usize) -> bool {
-    a.abs_diff(b) <= 1
+fn seconds_close(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1.0
 }
 
 fn extract_effective_ftp(details: &Value) -> Option<f64> {
@@ -690,13 +817,67 @@ fn extract_effective_ftp(details: &Value) -> Option<f64> {
     number_field(obj, &["icu_ftp", "effective_ftp", "ftp", "indoor_ftp"])
 }
 
-fn extract_power_zone_bounds(details: &Value) -> Option<Vec<f64>> {
+fn resolve_power_zone_bounds(
+    details: &Value,
+    override_bounds: Option<&[f64]>,
+) -> Result<ZoneBounds, String> {
+    if let Some(bounds) = override_bounds {
+        let values = bounds.to_vec();
+        validate_power_zone_bounds(&values)?;
+        return Ok(ZoneBounds {
+            values,
+            source: "custom.zone_bounds_percent",
+            model: "custom_power_zones",
+        });
+    }
+
+    extract_power_zone_bounds(details)
+        .ok_or_else(|| "activity power-zone stats require power-zone bounds".to_string())
+        .and_then(|bounds| {
+            validate_power_zone_bounds(&bounds.values)?;
+            Ok(bounds)
+        })
+}
+
+fn validate_power_zone_bounds(bounds: &[f64]) -> Result<(), String> {
+    if bounds.is_empty() {
+        return Err("activity power-zone stats require at least one power zone".to_string());
+    }
+    let mut previous = 0.0;
+    for (index, bound) in bounds.iter().enumerate() {
+        if !bound.is_finite() || *bound <= 0.0 {
+            return Err(format!(
+                "zone_bounds_percent[{}] must be a positive finite number",
+                index
+            ));
+        }
+        if index > 0 && *bound <= previous {
+            return Err("zone_bounds_percent must be strictly increasing".to_string());
+        }
+        previous = *bound;
+    }
+    if bounds.last().is_some_and(|bound| *bound < 999.0) {
+        return Err(
+            "zone_bounds_percent must end with an open-ended sentinel such as 999".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn extract_power_zone_bounds(details: &Value) -> Option<ZoneBounds> {
     let obj = details.as_object()?;
-    for key in ["icu_power_zones", "power_zones"] {
+    for (key, source) in [
+        ("icu_power_zones", "activity.icu_power_zones"),
+        ("power_zones", "activity.power_zones"),
+    ] {
         if let Some(bounds) = obj.get(key).and_then(Value::as_array) {
             let values: Vec<f64> = bounds.iter().filter_map(numeric_value).collect();
             if !values.is_empty() {
-                return Some(values);
+                return Some(ZoneBounds {
+                    values,
+                    source,
+                    model: "activity_power_zones",
+                });
             }
         }
     }
@@ -707,8 +888,9 @@ fn build_power_zone_definitions(
     details: &Value,
     effective_ftp: f64,
     zone_bounds: &[f64],
+    labels_override: Option<&[String]>,
 ) -> Vec<PowerZoneDefinition> {
-    let labels = power_zone_labels(details, zone_bounds.len());
+    let labels = power_zone_labels(details, zone_bounds.len(), labels_override);
 
     zone_bounds
         .iter()
@@ -743,7 +925,11 @@ fn build_power_zone_definitions(
         .collect()
 }
 
-fn power_zone_labels(details: &Value, zone_count: usize) -> Vec<String> {
+fn power_zone_labels(
+    details: &Value,
+    zone_count: usize,
+    labels_override: Option<&[String]>,
+) -> Vec<String> {
     const DEFAULT_LABELS: [&str; 7] = [
         "Active Recovery",
         "Endurance",
@@ -754,19 +940,23 @@ fn power_zone_labels(details: &Value, zone_count: usize) -> Vec<String> {
         "Anaerobic Capacity",
     ];
 
-    let labels = details
-        .as_object()
-        .and_then(|obj| {
-            obj.get("icu_power_zone_names")
-                .or_else(|| obj.get("power_zone_names"))
-        })
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
+    let labels = labels_override
+        .map(|values| values.to_vec())
+        .or_else(|| {
+            details
+                .as_object()
+                .and_then(|obj| {
+                    obj.get("icu_power_zone_names")
+                        .or_else(|| obj.get("power_zone_names"))
+                })
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
         })
         .unwrap_or_default();
 
@@ -821,20 +1011,43 @@ fn zone_index_for_watts(watts: f64, effective_ftp: f64, zone_bounds: &[f64]) -> 
         .unwrap_or_else(|| zone_bounds.len().saturating_sub(1))
 }
 
-fn total_elapsed_seconds(
+fn sample_second_weights(
     details: &Value,
     time: Option<&Vec<Value>>,
-    fallback_samples: usize,
-) -> usize {
-    if let Some(time) = time {
-        return time.len();
-    }
+    sample_count: usize,
+) -> Vec<f64> {
+    let Some(time) = time else {
+        return vec![1.0; sample_count];
+    };
+    let detail_elapsed = elapsed_time_seconds(details);
+    (0..sample_count)
+        .map(|index| {
+            let Some(start) = time.get(index).and_then(numeric_value) else {
+                return 1.0;
+            };
+            let end = time
+                .get(index + 1)
+                .and_then(numeric_value)
+                .or_else(|| detail_elapsed.filter(|elapsed| *elapsed > start));
+            end.map(|value| (value - start).max(0.0)).unwrap_or(0.0)
+        })
+        .collect()
+}
 
+fn total_elapsed_seconds(details: &Value, sample_weights: &[f64], fallback_samples: usize) -> f64 {
+    elapsed_time_seconds(details).unwrap_or_else(|| {
+        sample_weights
+            .iter()
+            .sum::<f64>()
+            .max(fallback_samples as f64)
+    })
+}
+
+fn elapsed_time_seconds(details: &Value) -> Option<f64> {
     details
         .as_object()
         .and_then(|obj| number_field(obj, &["elapsed_time", "total_elapsed_time", "moving_time"]))
-        .map(|seconds| seconds.round().max(0.0) as usize)
-        .unwrap_or(fallback_samples)
+        .map(|seconds| seconds.max(0.0))
 }
 
 fn power_zone_response(
@@ -842,18 +1055,19 @@ fn power_zone_response(
     heartrate: Option<&Vec<Value>>,
     cadence: Option<&Vec<Value>>,
     torque: Option<&Vec<Value>>,
-    indexes: &[usize],
+    samples: &[WeightedSample],
     min_response_seconds: usize,
 ) -> Value {
-    let response_seconds = indexes.len();
+    let response_seconds_value: f64 = samples.iter().map(|sample| sample.seconds).sum();
+    let response_seconds = rounded_seconds(response_seconds_value);
     let mut response = Map::new();
     response.insert(
         "valid".to_string(),
-        Value::from(response_seconds >= min_response_seconds),
+        Value::from(response_seconds_value >= min_response_seconds as f64),
     );
     response.insert("seconds".to_string(), Value::from(response_seconds));
 
-    if response_seconds < min_response_seconds {
+    if response_seconds_value < min_response_seconds as f64 {
         response.insert(
             "reason".to_string(),
             Value::String("below_min_response_seconds".to_string()),
@@ -861,22 +1075,22 @@ fn power_zone_response(
         return Value::Object(response);
     }
 
-    if let Some(stats) = power_response_stats(&collect_stream_values(Some(watts), indexes)) {
+    if let Some(stats) = power_response_stats(&collect_stream_values(Some(watts), samples)) {
         response.insert("power".to_string(), Value::Object(stats));
     }
     if let Some(stats) = heartrate_response_stats(&collect_stream_values(
         heartrate.map(Vec::as_slice),
-        indexes,
+        samples,
     )) {
         response.insert("heartrate".to_string(), Value::Object(stats));
     }
     if let Some(stats) =
-        cadence_response_stats(&collect_stream_values(cadence.map(Vec::as_slice), indexes))
+        cadence_response_stats(&collect_stream_values(cadence.map(Vec::as_slice), samples))
     {
         response.insert("cadence".to_string(), Value::Object(stats));
     }
     if let Some(stats) =
-        torque_response_stats(&collect_stream_values(torque.map(Vec::as_slice), indexes))
+        torque_response_stats(&collect_stream_values(torque.map(Vec::as_slice), samples))
     {
         response.insert("torque".to_string(), Value::Object(stats));
     }
@@ -884,78 +1098,123 @@ fn power_zone_response(
     Value::Object(response)
 }
 
-fn collect_stream_values(stream: Option<&[Value]>, indexes: &[usize]) -> Vec<f64> {
+fn collect_stream_values(
+    stream: Option<&[Value]>,
+    samples: &[WeightedSample],
+) -> Vec<WeightedValue> {
     let Some(stream) = stream else {
         return Vec::new();
     };
-    indexes
+    samples
         .iter()
-        .filter_map(|index| stream.get(*index).and_then(numeric_value))
+        .filter_map(|sample| {
+            stream
+                .get(sample.index)
+                .and_then(numeric_value)
+                .filter(|_| sample.seconds > 0.0)
+                .map(|value| WeightedValue {
+                    value,
+                    seconds: sample.seconds,
+                })
+        })
         .collect()
 }
 
-fn power_response_stats(values: &[f64]) -> Option<Map<String, Value>> {
+fn power_response_stats(values: &[WeightedValue]) -> Option<Map<String, Value>> {
     let mut stats = Map::new();
     insert_number(&mut stats, "avg", average(values)?);
     insert_number(&mut stats, "p50", percentile(values, 50)?);
     Some(stats)
 }
 
-fn heartrate_response_stats(values: &[f64]) -> Option<Map<String, Value>> {
+fn heartrate_response_stats(values: &[WeightedValue]) -> Option<Map<String, Value>> {
     let mut stats = Map::new();
     insert_number(&mut stats, "avg", average(values)?);
     insert_number(&mut stats, "p90", percentile(values, 90)?);
     Some(stats)
 }
 
-fn cadence_response_stats(values: &[f64]) -> Option<Map<String, Value>> {
+fn cadence_response_stats(values: &[WeightedValue]) -> Option<Map<String, Value>> {
     let mut stats = Map::new();
     insert_number(&mut stats, "avg", average(values)?);
     insert_number(&mut stats, "min", min_value(values)?);
     Some(stats)
 }
 
-fn torque_response_stats(values: &[f64]) -> Option<Map<String, Value>> {
+fn torque_response_stats(values: &[WeightedValue]) -> Option<Map<String, Value>> {
     let mut stats = Map::new();
     insert_number(&mut stats, "avg", average(values)?);
     insert_number(&mut stats, "max", max_value(values)?);
     Some(stats)
 }
 
-fn average(values: &[f64]) -> Option<f64> {
+fn average(values: &[WeightedValue]) -> Option<f64> {
     if values.is_empty() {
         return None;
     }
-    Some(values.iter().sum::<f64>() / values.len() as f64)
+    let seconds: f64 = values.iter().map(|value| value.seconds).sum();
+    if seconds <= 0.0 {
+        return None;
+    }
+    Some(
+        values
+            .iter()
+            .map(|value| value.value * value.seconds)
+            .sum::<f64>()
+            / seconds,
+    )
 }
 
-fn min_value(values: &[f64]) -> Option<f64> {
-    values.iter().copied().reduce(f64::min)
+fn min_value(values: &[WeightedValue]) -> Option<f64> {
+    values.iter().map(|value| value.value).reduce(f64::min)
 }
 
-fn max_value(values: &[f64]) -> Option<f64> {
-    values.iter().copied().reduce(f64::max)
+fn max_value(values: &[WeightedValue]) -> Option<f64> {
+    values.iter().map(|value| value.value).reduce(f64::max)
 }
 
-fn percentile(values: &[f64], percentile: usize) -> Option<f64> {
+fn percentile(values: &[WeightedValue], percentile: usize) -> Option<f64> {
     if values.is_empty() {
         return None;
     }
     let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let index = sorted.len() * percentile / 100;
-    sorted.get(index.min(sorted.len() - 1)).copied()
+    sorted.sort_by(|a, b| {
+        a.value
+            .partial_cmp(&b.value)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let total_seconds: f64 = sorted.iter().map(|value| value.seconds).sum();
+    if total_seconds <= 0.0 {
+        return None;
+    }
+    let target = total_seconds * percentile as f64 / 100.0;
+    let mut cumulative = 0.0;
+    for value in &sorted {
+        cumulative += value.seconds;
+        if cumulative >= target {
+            return Some(value.value);
+        }
+    }
+    sorted.last().map(|value| value.value)
 }
 
 fn watts_for_percent(effective_ftp: f64, percent: f64) -> i64 {
     (effective_ftp * percent / 100.0).round() as i64
 }
 
-fn percent(seconds: usize, total_seconds: usize) -> f64 {
-    if total_seconds == 0 {
+fn percent(seconds: f64, total_seconds: f64) -> f64 {
+    if total_seconds <= 0.0 {
         return 0.0;
     }
-    seconds as f64 / total_seconds as f64 * 100.0
+    seconds / total_seconds * 100.0
+}
+
+fn rounded_seconds(seconds: f64) -> i64 {
+    seconds.round().max(0.0) as i64
+}
+
+fn rounded_seconds_signed(seconds: f64) -> i64 {
+    seconds.round() as i64
 }
 
 fn insert_number(target: &mut Map<String, Value>, key: &str, value: f64) {
@@ -1630,10 +1889,15 @@ mod tests {
             "icu_ftp": 100,
             "elapsed_time": 5,
             "moving_time": 3,
-            "icu_power_zones": [54, 75, 87, 94, 105],
+            "icu_power_zones": [54, 75, 87, 94, 105, 120, 999],
             "icu_zone_times": [
                 {"id": "Z1", "secs": 2},
-                {"id": "Z5", "secs": 1}
+                {"id": "Z2", "secs": 0},
+                {"id": "Z3", "secs": 0},
+                {"id": "Z4", "secs": 0},
+                {"id": "Z5", "secs": 1},
+                {"id": "Z6", "secs": 0},
+                {"id": "Z7", "secs": 0}
             ]
         });
         let streams = serde_json::json!({
@@ -1647,10 +1911,14 @@ mod tests {
             ]
         });
 
-        let out = activity_power_zone_stats("i1", &details, &streams, 1).unwrap();
+        let out = activity_power_zone_stats("i1", &details, &streams, 1, None, None).unwrap();
         assert_eq!(out["activity_id"], "i1");
         assert_eq!(out["effective_ftp"], 100);
         assert_eq!(out["total_elapsed_seconds"], 5);
+        assert_eq!(out["analysis_time_basis"], "moving_time");
+        assert_eq!(out["include_filter"], "velocity_smooth_gt_0");
+        assert_eq!(out["basis_matches_moving_time"], true);
+        assert_eq!(out["movement_seconds"], 3);
         assert_eq!(out["included_seconds"], 3);
         assert_eq!(out["excluded_seconds"], 2);
 
@@ -1664,6 +1932,9 @@ mod tests {
         assert_eq!(z5["response"]["heartrate"]["p90"], 150);
         assert_eq!(z5["response"]["cadence"]["min"], 90);
         assert_eq!(z5["response"]["torque"]["max"], 30);
+        assert!(out.get("reference_zone_times").is_none());
+        assert!(z5.get("intervals_icu_seconds").is_none());
+        assert!(z5.get("delta_vs_intervals_icu_seconds").is_none());
         let zone_seconds: i64 = zones
             .iter()
             .map(|zone| zone["seconds"].as_i64().unwrap())
@@ -1683,7 +1954,8 @@ mod tests {
         let details = serde_json::json!({
             "id": "i1",
             "icu_ftp": 100,
-            "icu_power_zones": [54, 75, 87, 94, 105],
+            "elapsed_time": 3,
+            "icu_power_zones": [54, 75, 87, 94, 105, 120, 999],
             "icu_zone_times": [
                 {"id": "Z5", "secs": 3}
             ]
@@ -1694,7 +1966,7 @@ mod tests {
             "heartrate": [150, 160, 170]
         });
 
-        let out = activity_power_zone_stats("i1", &details, &streams, 4).unwrap();
+        let out = activity_power_zone_stats("i1", &details, &streams, 4, None, None).unwrap();
         let z5 = out["zones"]
             .as_array()
             .unwrap()
@@ -1706,6 +1978,56 @@ mod tests {
         assert_eq!(z5["response"]["reason"], "below_min_response_seconds");
         assert_eq!(z5["response"]["seconds"], 3);
         assert!(z5["response"].get("power").is_none());
+    }
+
+    #[test]
+    fn activity_power_zone_stats_accepts_custom_bounds_and_labels() {
+        let details = serde_json::json!({
+            "id": "i1",
+            "icu_ftp": 100,
+            "elapsed_time": 3,
+            "icu_power_zones": [54, 75, 87, 94, 105, 120, 999]
+        });
+        let streams = serde_json::json!({
+            "time": [0, 1, 2],
+            "watts": [50, 80, 130]
+        });
+        let bounds = vec![50.0, 100.0, 999.0];
+        let labels = vec!["Easy".to_string(), "Work".to_string(), "Hard".to_string()];
+
+        let out =
+            activity_power_zone_stats("i1", &details, &streams, 1, Some(&bounds), Some(&labels))
+                .unwrap();
+
+        assert_eq!(out["zone_model"], "custom_power_zones");
+        assert_eq!(out["zone_source"], "custom.zone_bounds_percent");
+        let zones = out["zones"].as_array().unwrap();
+        assert_eq!(zones[0]["label"], "Easy");
+        assert_eq!(zones[1]["label"], "Work");
+        assert_eq!(zones[2]["label"], "Hard");
+        assert_eq!(zones[0]["seconds"], 1);
+        assert_eq!(zones[1]["seconds"], 1);
+        assert_eq!(zones[2]["seconds"], 1);
+    }
+
+    #[test]
+    fn activity_power_zone_stats_rejects_non_increasing_custom_bounds() {
+        let details = serde_json::json!({
+            "id": "i1",
+            "icu_ftp": 100,
+            "elapsed_time": 1,
+            "icu_power_zones": [54, 75, 87, 94, 105, 120, 999]
+        });
+        let streams = serde_json::json!({
+            "time": [0],
+            "watts": [50]
+        });
+        let bounds = vec![54.0, 54.0, 999.0];
+
+        let err = activity_power_zone_stats("i1", &details, &streams, 1, Some(&bounds), None)
+            .unwrap_err();
+
+        assert!(err.contains("strictly increasing"));
     }
 
     #[test]

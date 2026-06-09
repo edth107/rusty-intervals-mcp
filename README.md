@@ -462,12 +462,19 @@ With `summary=false`, returns `total_count`, `returned_count`, `zone_type`, and 
 |-----------|------|-------------|
 | `activity_id` | string | Activity ID (required) |
 | `min_response_seconds` | integer | Minimum seconds before response stats are valid (default: 30) |
+| `zone_bounds_percent` | array | Optional Intervals-style inclusive upper power-zone bounds as %FTP, e.g. `[54,75,87,94,105,120,999]`; must be strictly increasing and end with an open sentinel such as `999` |
+| `zone_labels` | array | Optional custom labels matching `zone_bounds_percent` |
 
-Returns activity power-zone distribution plus per-zone response stats. Each zone includes FTP-derived bounds, seconds, percent included, and `response` with `valid`, `seconds`, power, heartrate, cadence, and torque stats. Zone seconds and response seconds use the same included samples; stopped samples are excluded when a movement stream is available. Short zones return `response.valid=false` with `reason="below_min_response_seconds"`.
+Returns raw-stream power-zone distribution plus per-zone response stats. By default it uses the activity's Intervals.icu zone definition from `icu_power_zones`; custom bounds can override that with contiguous upper bounds, so gaps cannot be expressed. Seconds are calculated from `time` deltas, not sample counts. For moving-time analysis the tool uses `velocity_smooth > 0` when that matches activity `moving_time`; otherwise it declares the elapsed-stream basis in metadata. The production response intentionally omits Intervals.icu comparison fields such as `reference_zone_times`, `intervals_icu_seconds`, and `delta_vs_intervals_icu_seconds`.
 
 **Example - Power zone response:**
 ```json
 {"activity_id": "i123", "min_response_seconds": 30}
+```
+
+**Example - TrainerRoad-style custom zones:**
+```json
+{"activity_id": "i123", "zone_bounds_percent": [54,75,87,94,105,120,999]}
 ```
 
 #### `get_activity_details`

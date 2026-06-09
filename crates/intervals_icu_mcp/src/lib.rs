@@ -553,7 +553,7 @@ impl IntervalsMcpHandler {
 
     #[tool(
         name = "get_activity_power_zone_stats",
-        description = "Get power-zone distribution and response stats. Params: activity_id, min_response_seconds (default 30)."
+        description = "Get raw-stream power-zone distribution and response. Uses activity.icu_power_zones, time-delta seconds, moving filter; custom zone_bounds_percent/zone_labels. No ICU comparison fields."
     )]
     async fn get_activity_power_zone_stats(
         &self,
@@ -586,6 +586,8 @@ impl IntervalsMcpHandler {
             &details,
             &streams,
             p.min_response_seconds.unwrap_or(30) as usize,
+            p.zone_bounds_percent.as_deref(),
+            p.zone_labels.as_deref(),
         )?;
 
         Ok(Json(ObjectResult { value: result }))
