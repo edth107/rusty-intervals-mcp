@@ -553,7 +553,7 @@ impl IntervalsMcpHandler {
 
     #[tool(
         name = "get_activity_power_zone_stats",
-        description = "Get raw-stream power-zone distribution and response. Uses activity.icu_power_zones, time-delta seconds, moving filter; custom zone_bounds_percent/zone_labels. No ICU comparison fields."
+        description = "Raw-stream power-zone response. Params: activity_id, window({type:elapsed_time|moving_time|distance,start,end}), min_response_seconds, zone_bounds_percent/zone_labels. No ICU comparison fields."
     )]
     async fn get_activity_power_zone_stats(
         &self,
@@ -565,19 +565,25 @@ impl IntervalsMcpHandler {
             .get_activity_details(&p.activity_id)
             .await
             .map_err(|e| e.to_string())?;
+        let needs_distance = p
+            .window
+            .as_ref()
+            .and_then(|window| window.window_type.as_deref())
+            .is_some_and(|window_type| window_type.eq_ignore_ascii_case("distance"));
+        let mut stream_types = vec![
+            "time".to_string(),
+            "watts".to_string(),
+            "heartrate".to_string(),
+            "cadence".to_string(),
+            "torque".to_string(),
+            "velocity_smooth".to_string(),
+        ];
+        if needs_distance {
+            stream_types.push("distance".to_string());
+        }
         let streams = self
             .client
-            .get_activity_streams(
-                &p.activity_id,
-                Some(vec![
-                    "time".to_string(),
-                    "watts".to_string(),
-                    "heartrate".to_string(),
-                    "cadence".to_string(),
-                    "torque".to_string(),
-                    "velocity_smooth".to_string(),
-                ]),
-            )
+            .get_activity_streams(&p.activity_id, Some(stream_types))
             .await
             .map_err(|e| e.to_string())?;
 
@@ -588,6 +594,7 @@ impl IntervalsMcpHandler {
             p.min_response_seconds.unwrap_or(30) as usize,
             p.zone_bounds_percent.as_deref(),
             p.zone_labels.as_deref(),
+            p.window.as_ref(),
         )?;
 
         Ok(Json(ObjectResult { value: result }))

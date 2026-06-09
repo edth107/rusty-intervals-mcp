@@ -462,14 +462,25 @@ With `summary=false`, returns `total_count`, `returned_count`, `zone_type`, and 
 |-----------|------|-------------|
 | `activity_id` | string | Activity ID (required) |
 | `min_response_seconds` | integer | Minimum seconds before response stats are valid (default: 30) |
+| `window` | object | Optional analysis window applied before the movement mask; supports `{type:"elapsed_time"|"moving_time"|"distance", start, end}` with exclusive `end` |
 | `zone_bounds_percent` | array | Optional Intervals-style inclusive upper power-zone bounds as %FTP, e.g. `[54,75,87,94,105,120,999]`; must be strictly increasing and end with an open sentinel such as `999` |
 | `zone_labels` | array | Optional custom labels matching `zone_bounds_percent` |
 
-Returns raw-stream power-zone distribution plus per-zone response stats. By default it uses the activity's Intervals.icu zone definition from `icu_power_zones`; custom bounds can override that with contiguous upper bounds, so gaps cannot be expressed. Seconds are calculated from `time` deltas, not sample counts. For moving-time analysis the tool uses `velocity_smooth > 0` when that matches activity `moving_time`; otherwise it declares the elapsed-stream basis in metadata. The production response intentionally omits Intervals.icu comparison fields such as `reference_zone_times`, `intervals_icu_seconds`, and `delta_vs_intervals_icu_seconds`.
+Returns raw-stream power-zone distribution plus per-zone response stats. By default it uses the activity's Intervals.icu zone definition from `icu_power_zones`; custom bounds can override that with contiguous upper bounds, so gaps cannot be expressed. Seconds are calculated from `time` deltas, not sample counts. If `window` is provided, the tool first selects that window, then applies the same movement/include mask inside it. `elapsed_time` windows use the `time` stream, `moving_time` windows use cumulative `velocity_smooth > 0` seconds to resolve the elapsed-stream start/end indices, and `distance` windows use meters from the `distance` stream. For moving-time analysis the tool uses `velocity_smooth > 0` when that matches activity `moving_time`; otherwise it declares the elapsed-stream basis in metadata. The production response intentionally omits Intervals.icu comparison fields such as `reference_zone_times`, `intervals_icu_seconds`, and `delta_vs_intervals_icu_seconds`.
 
 **Example - Power zone response:**
 ```json
 {"activity_id": "i123", "min_response_seconds": 30}
+```
+
+**Example - Windowed climb response:**
+```json
+{"activity_id": "i123", "window": {"type": "elapsed_time", "start": "00:42:00", "end": "00:57:30"}}
+```
+
+**Example - Distance window:**
+```json
+{"activity_id": "i123", "window": {"type": "distance", "start": 12000, "end": 18000}}
 ```
 
 **Example - TrainerRoad-style custom zones:**

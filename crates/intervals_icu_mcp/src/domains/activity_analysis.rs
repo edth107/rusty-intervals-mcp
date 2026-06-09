@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
-use crate::types::StreamWindow;
+use crate::types::{ActivityPowerZoneStatsWindow, StreamWindow};
 
 const KEY_DURATIONS: &[u32] = &[1, 5, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600];
 
@@ -552,6 +552,23 @@ struct IncludeDecision {
     basis_delta_seconds: Option<f64>,
 }
 
+#[derive(Debug)]
+struct MovementBasis {
+    mask: Option<Vec<bool>>,
+    raw_mask: Option<Vec<bool>>,
+    analysis_time_basis: &'static str,
+    movement_seconds: Option<f64>,
+    basis_matches_moving_time: Option<bool>,
+    basis_delta_seconds: Option<f64>,
+}
+
+#[derive(Debug)]
+struct AppliedPowerZoneWindow {
+    mask: Vec<bool>,
+    metadata: Value,
+    elapsed_seconds: f64,
+}
+
 pub fn activity_power_zone_stats(
     activity_id: &str,
     details: &Value,
@@ -559,6 +576,7 @@ pub fn activity_power_zone_stats(
     min_response_seconds: usize,
     zone_bounds_override: Option<&[f64]>,
     zone_labels_override: Option<&[String]>,
+    window: Option<&ActivityPowerZoneStatsWindow>,
 ) -> Result<Value, String> {
     let effective_ftp = extract_effective_ftp(details)
         .ok_or_else(|| "activity power-zone stats require an activity FTP".to_string())?;
@@ -575,11 +593,25 @@ pub fn activity_power_zone_stats(
     let cadence = stream_data(streams, "cadence");
     let torque = stream_data(streams, "torque");
     let velocity_smooth = stream_data(streams, "velocity_smooth");
+    let distance = stream_data(streams, "distance");
 
     let sample_weights = sample_second_weights(details, time, watts.len());
-    let total_elapsed_seconds = total_elapsed_seconds(details, &sample_weights, watts.len());
+    let movement_basis = movement_basis(details, velocity_smooth, &sample_weights);
+    let applied_window = power_zone_window_mask(
+        window,
+        time,
+        distance,
+        &sample_weights,
+        movement_basis.mask.as_deref(),
+        movement_basis.mask.is_some(),
+    )?;
+    let window_mask = applied_window.as_ref().map(|window| window.mask.as_slice());
     let include_decision =
-        included_power_zone_sample_mask(details, velocity_smooth, &sample_weights);
+        included_power_zone_sample_mask(&movement_basis, &sample_weights, window_mask);
+    let total_elapsed_seconds = applied_window
+        .as_ref()
+        .map(|window| window.elapsed_seconds)
+        .unwrap_or_else(|| total_elapsed_seconds(details, &sample_weights, watts.len()));
     let zones = build_power_zone_definitions(
         details,
         effective_ftp,
@@ -721,21 +753,24 @@ pub fn activity_power_zone_stats(
         "min_response_seconds".to_string(),
         Value::from(min_response_seconds),
     );
+    if let Some(applied_window) = applied_window {
+        result.insert("window".to_string(), applied_window.metadata);
+    }
     result.insert("zones".to_string(), Value::Array(zone_values));
 
     Ok(Value::Object(result))
 }
 
-fn included_power_zone_sample_mask(
+fn movement_basis(
     details: &Value,
     velocity_smooth: Option<&Vec<Value>>,
     sample_weights: &[f64],
-) -> IncludeDecision {
+) -> MovementBasis {
     let Some(velocity_smooth) = velocity_smooth else {
-        return IncludeDecision {
+        return MovementBasis {
             mask: None,
+            raw_mask: None,
             analysis_time_basis: "elapsed_stream_samples",
-            include_filter: "none",
             movement_seconds: None,
             basis_matches_moving_time: moving_time_seconds(details).map(|_| false),
             basis_delta_seconds: None,
@@ -761,19 +796,19 @@ fn included_power_zone_sample_mask(
         let delta = movement_seconds - moving_time;
         let matches = seconds_close(movement_seconds, moving_time);
         if movement_seconds > 0.0 && movement_seconds < stream_seconds && matches {
-            return IncludeDecision {
-                mask: Some(mask),
+            return MovementBasis {
+                mask: Some(mask.clone()),
+                raw_mask: Some(mask),
                 analysis_time_basis: "moving_time",
-                include_filter: "velocity_smooth_gt_0",
                 movement_seconds: Some(movement_seconds),
                 basis_matches_moving_time: Some(true),
                 basis_delta_seconds: Some(delta),
             };
         }
-        return IncludeDecision {
+        return MovementBasis {
             mask: None,
+            raw_mask: Some(mask),
             analysis_time_basis: "elapsed_stream_samples",
-            include_filter: "none",
             movement_seconds: Some(movement_seconds),
             basis_matches_moving_time: Some(matches),
             basis_delta_seconds: Some(delta),
@@ -781,24 +816,343 @@ fn included_power_zone_sample_mask(
     }
 
     if movement_seconds > 0.0 && movement_seconds < stream_seconds {
-        return IncludeDecision {
-            mask: Some(mask),
+        return MovementBasis {
+            mask: Some(mask.clone()),
+            raw_mask: Some(mask),
             analysis_time_basis: "movement_stream",
-            include_filter: "velocity_smooth_gt_0",
             movement_seconds: Some(movement_seconds),
             basis_matches_moving_time: None,
             basis_delta_seconds: None,
         };
     }
 
-    IncludeDecision {
+    MovementBasis {
         mask: None,
+        raw_mask: Some(mask),
         analysis_time_basis: "elapsed_stream_samples",
-        include_filter: "none",
         movement_seconds: Some(movement_seconds),
         basis_matches_moving_time: None,
         basis_delta_seconds: None,
     }
+}
+
+fn included_power_zone_sample_mask(
+    movement_basis: &MovementBasis,
+    sample_weights: &[f64],
+    window_mask: Option<&[bool]>,
+) -> IncludeDecision {
+    let mask = combine_include_masks(movement_basis.mask.as_deref(), window_mask);
+    let movement_seconds = movement_basis
+        .raw_mask
+        .as_deref()
+        .map(|movement_mask| scoped_mask_seconds(sample_weights, Some(movement_mask), window_mask));
+
+    IncludeDecision {
+        mask,
+        analysis_time_basis: movement_basis.analysis_time_basis,
+        include_filter: include_filter_name(movement_basis.mask.is_some(), window_mask.is_some()),
+        movement_seconds: movement_seconds.or(movement_basis.movement_seconds),
+        basis_matches_moving_time: movement_basis.basis_matches_moving_time,
+        basis_delta_seconds: movement_basis.basis_delta_seconds,
+    }
+}
+
+fn include_filter_name(has_movement_mask: bool, has_window_mask: bool) -> &'static str {
+    match (has_movement_mask, has_window_mask) {
+        (true, true) => "window_and_velocity_smooth_gt_0",
+        (true, false) => "velocity_smooth_gt_0",
+        (false, true) => "window",
+        (false, false) => "none",
+    }
+}
+
+fn combine_include_masks(
+    movement_mask: Option<&[bool]>,
+    window_mask: Option<&[bool]>,
+) -> Option<Vec<bool>> {
+    match (movement_mask, window_mask) {
+        (Some(movement), Some(window)) => {
+            let len = movement.len().max(window.len());
+            Some(
+                (0..len)
+                    .map(|index| {
+                        movement.get(index).copied().unwrap_or(false)
+                            && window.get(index).copied().unwrap_or(false)
+                    })
+                    .collect(),
+            )
+        }
+        (Some(mask), None) | (None, Some(mask)) => Some(mask.to_vec()),
+        (None, None) => None,
+    }
+}
+
+fn scoped_mask_seconds(
+    sample_weights: &[f64],
+    primary_mask: Option<&[bool]>,
+    window_mask: Option<&[bool]>,
+) -> f64 {
+    sample_weights
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            primary_mask
+                .map(|mask| mask.get(*index).copied().unwrap_or(false))
+                .unwrap_or(true)
+                && window_mask
+                    .map(|mask| mask.get(*index).copied().unwrap_or(false))
+                    .unwrap_or(true)
+        })
+        .map(|(_, seconds)| *seconds)
+        .sum()
+}
+
+fn power_zone_window_mask(
+    window: Option<&ActivityPowerZoneStatsWindow>,
+    time: Option<&Vec<Value>>,
+    distance: Option<&Vec<Value>>,
+    sample_weights: &[f64],
+    movement_mask: Option<&[bool]>,
+    movement_basis_available: bool,
+) -> Result<Option<AppliedPowerZoneWindow>, String> {
+    let Some(window) = window else {
+        return Ok(None);
+    };
+
+    let window_type = window.window_type.as_deref().unwrap_or("elapsed_time");
+    let applied = if window_type.eq_ignore_ascii_case("elapsed_time") {
+        elapsed_power_zone_window(window, time, sample_weights)?
+    } else if window_type.eq_ignore_ascii_case("moving_time") {
+        moving_power_zone_window(
+            window,
+            sample_weights,
+            movement_mask,
+            movement_basis_available,
+        )?
+    } else if window_type.eq_ignore_ascii_case("distance") {
+        distance_power_zone_window(window, distance, sample_weights)?
+    } else {
+        return Err(format!(
+            "unsupported power-zone stats window type '{window_type}', expected elapsed_time, moving_time, or distance"
+        ));
+    };
+
+    Ok(Some(applied))
+}
+
+fn elapsed_power_zone_window(
+    window: &ActivityPowerZoneStatsWindow,
+    time: Option<&Vec<Value>>,
+    sample_weights: &[f64],
+) -> Result<AppliedPowerZoneWindow, String> {
+    let time_data = time
+        .ok_or_else(|| "power-zone stats elapsed_time window requires a time stream".to_string())?;
+    let start_seconds = parse_window_time_seconds(&window.start, "window.start")?;
+    let end_seconds = parse_window_time_seconds(&window.end, "window.end")?;
+    if end_seconds <= start_seconds {
+        return Err("power-zone stats window end must be after start".to_string());
+    }
+
+    let start_index = first_index_at_or_after(time_data, start_seconds);
+    let end_index = first_index_at_or_after(time_data, end_seconds).max(start_index);
+    let mask = contiguous_window_mask(sample_weights.len(), start_index, end_index);
+    let elapsed_seconds = scoped_mask_seconds(sample_weights, None, Some(&mask));
+    let first_available_seconds = first_available_seconds(time_data);
+    let last_available_seconds = last_available_seconds(time_data);
+    let actual_start_seconds = seconds_at_index(time_data, start_index);
+    let actual_end_seconds = seconds_at_index(time_data, end_index).or(last_available_seconds);
+    let clamped_start = first_available_seconds.is_some_and(|first| start_seconds < first)
+        || (actual_start_seconds.is_none() && start_index >= time_data.len());
+    let clamped_end = last_available_seconds.is_some_and(|last| end_seconds > last);
+
+    Ok(AppliedPowerZoneWindow {
+        mask,
+        elapsed_seconds,
+        metadata: serde_json::json!({
+            "type": "elapsed_time",
+            "requested_start": window.start.clone(),
+            "requested_end": window.end.clone(),
+            "start_seconds": start_seconds,
+            "end_seconds": end_seconds,
+            "actual_start_seconds": actual_start_seconds,
+            "actual_end_seconds": actual_end_seconds,
+            "elapsed_seconds": rounded_seconds(elapsed_seconds),
+            "clamped": clamped_start || clamped_end,
+            "clamped_start": clamped_start,
+            "clamped_end": clamped_end,
+            "start_index": start_index,
+            "end_index": end_index,
+            "end_exclusive": true,
+            "points": end_index.saturating_sub(start_index)
+        }),
+    })
+}
+
+fn moving_power_zone_window(
+    window: &ActivityPowerZoneStatsWindow,
+    sample_weights: &[f64],
+    movement_mask: Option<&[bool]>,
+    movement_basis_available: bool,
+) -> Result<AppliedPowerZoneWindow, String> {
+    if !movement_basis_available {
+        return Err(
+            "power-zone stats moving_time window requires a trusted velocity_smooth movement basis"
+                .to_string(),
+        );
+    }
+    let movement_mask = movement_mask.ok_or_else(|| {
+        "power-zone stats moving_time window requires a trusted velocity_smooth movement basis"
+            .to_string()
+    })?;
+    let start_seconds = parse_window_time_seconds(&window.start, "window.start")?;
+    let end_seconds = parse_window_time_seconds(&window.end, "window.end")?;
+    if end_seconds <= start_seconds {
+        return Err("power-zone stats window end must be after start".to_string());
+    }
+
+    let mut cumulative = 0.0;
+    let mut actual_start_seconds: Option<f64> = None;
+    let mut actual_end_seconds: Option<f64> = None;
+    let mut start_index: Option<usize> = None;
+    let mut end_index: Option<usize> = None;
+    let mut moving_points = 0usize;
+
+    for (index, seconds) in sample_weights.iter().enumerate() {
+        if !movement_mask.get(index).copied().unwrap_or(false) || *seconds <= 0.0 {
+            continue;
+        }
+
+        let sample_start = cumulative;
+        let sample_end = cumulative + *seconds;
+        if sample_start >= start_seconds && sample_start < end_seconds {
+            actual_start_seconds.get_or_insert(sample_start);
+            actual_end_seconds = Some(sample_end);
+            start_index.get_or_insert(index);
+            end_index = Some(index + 1);
+            moving_points += 1;
+        }
+        cumulative = sample_end;
+    }
+
+    let start_index_value = start_index.unwrap_or(sample_weights.len());
+    let end_index_value = end_index.unwrap_or(start_index_value);
+    let mask = contiguous_window_mask(sample_weights.len(), start_index_value, end_index_value);
+    let elapsed_seconds = scoped_mask_seconds(sample_weights, None, Some(&mask));
+    let moving_seconds = scoped_mask_seconds(sample_weights, Some(movement_mask), Some(&mask));
+    let clamped_start = start_seconds > cumulative || actual_start_seconds.is_none();
+    let clamped_end = end_seconds > cumulative;
+
+    Ok(AppliedPowerZoneWindow {
+        mask,
+        elapsed_seconds,
+        metadata: serde_json::json!({
+            "type": "moving_time",
+            "requested_start": window.start.clone(),
+            "requested_end": window.end.clone(),
+            "start_seconds": start_seconds,
+            "end_seconds": end_seconds,
+            "actual_start_seconds": actual_start_seconds,
+            "actual_end_seconds": actual_end_seconds,
+            "elapsed_seconds": rounded_seconds(elapsed_seconds),
+            "moving_seconds": rounded_seconds(moving_seconds),
+            "available_moving_seconds": rounded_seconds(cumulative),
+            "clamped": clamped_start || clamped_end,
+            "clamped_start": clamped_start,
+            "clamped_end": clamped_end,
+            "start_index": start_index_value,
+            "end_index": end_index_value,
+            "end_exclusive": true,
+            "points": end_index_value.saturating_sub(start_index_value),
+            "moving_points": moving_points
+        }),
+    })
+}
+
+fn distance_power_zone_window(
+    window: &ActivityPowerZoneStatsWindow,
+    distance: Option<&Vec<Value>>,
+    sample_weights: &[f64],
+) -> Result<AppliedPowerZoneWindow, String> {
+    let distance_data = distance
+        .ok_or_else(|| "power-zone stats distance window requires a distance stream".to_string())?;
+    let start_meters = parse_window_number(&window.start, "window.start")?;
+    let end_meters = parse_window_number(&window.end, "window.end")?;
+    if end_meters <= start_meters {
+        return Err("power-zone stats window end must be after start".to_string());
+    }
+
+    let start_index = first_numeric_index_at_or_after(distance_data, start_meters);
+    let end_index = first_numeric_index_at_or_after(distance_data, end_meters).max(start_index);
+    let mask = contiguous_window_mask(sample_weights.len(), start_index, end_index);
+    let elapsed_seconds = scoped_mask_seconds(sample_weights, None, Some(&mask));
+    let first_available_meters = first_available_number(distance_data);
+    let last_available_meters = last_available_number(distance_data);
+    let actual_start_meters = number_at_index(distance_data, start_index);
+    let actual_end_meters = number_at_index(distance_data, end_index).or(last_available_meters);
+    let clamped_start = first_available_meters.is_some_and(|first| start_meters < first)
+        || (actual_start_meters.is_none() && start_index >= distance_data.len());
+    let clamped_end = last_available_meters.is_some_and(|last| end_meters > last);
+
+    Ok(AppliedPowerZoneWindow {
+        mask,
+        elapsed_seconds,
+        metadata: serde_json::json!({
+            "type": "distance",
+            "requested_start": window.start.clone(),
+            "requested_end": window.end.clone(),
+            "start_meters": start_meters,
+            "end_meters": end_meters,
+            "actual_start_meters": actual_start_meters,
+            "actual_end_meters": actual_end_meters,
+            "elapsed_seconds": rounded_seconds(elapsed_seconds),
+            "clamped": clamped_start || clamped_end,
+            "clamped_start": clamped_start,
+            "clamped_end": clamped_end,
+            "start_index": start_index,
+            "end_index": end_index,
+            "end_exclusive": true,
+            "points": end_index.saturating_sub(start_index)
+        }),
+    })
+}
+
+fn contiguous_window_mask(sample_count: usize, start_index: usize, end_index: usize) -> Vec<bool> {
+    let start = start_index.min(sample_count);
+    let end = end_index.min(sample_count).max(start);
+    (0..sample_count)
+        .map(|index| index >= start && index < end)
+        .collect()
+}
+
+fn parse_window_time_seconds(value: &Value, field: &str) -> Result<f64, String> {
+    if let Some(text) = value.as_str() {
+        return parse_elapsed_seconds(text).map_err(|err| format!("{field}: {err}"));
+    }
+    parse_window_number(value, field)
+}
+
+fn parse_window_number(value: &Value, field: &str) -> Result<f64, String> {
+    numeric_value(value)
+        .filter(|number| number.is_finite() && *number >= 0.0)
+        .ok_or_else(|| format!("{field} must be a non-negative finite number"))
+}
+
+fn first_numeric_index_at_or_after(data: &[Value], target: f64) -> usize {
+    data.iter()
+        .position(|value| numeric_value(value).is_some_and(|number| number >= target))
+        .unwrap_or(data.len())
+}
+
+fn number_at_index(data: &[Value], index: usize) -> Option<f64> {
+    data.get(index).and_then(numeric_value)
+}
+
+fn first_available_number(data: &[Value]) -> Option<f64> {
+    data.iter().find_map(numeric_value)
+}
+
+fn last_available_number(data: &[Value]) -> Option<f64> {
+    data.iter().rev().find_map(numeric_value)
 }
 
 fn moving_time_seconds(details: &Value) -> Option<f64> {
@@ -1911,7 +2265,7 @@ mod tests {
             ]
         });
 
-        let out = activity_power_zone_stats("i1", &details, &streams, 1, None, None).unwrap();
+        let out = activity_power_zone_stats("i1", &details, &streams, 1, None, None, None).unwrap();
         assert_eq!(out["activity_id"], "i1");
         assert_eq!(out["effective_ftp"], 100);
         assert_eq!(out["total_elapsed_seconds"], 5);
@@ -1966,7 +2320,7 @@ mod tests {
             "heartrate": [150, 160, 170]
         });
 
-        let out = activity_power_zone_stats("i1", &details, &streams, 4, None, None).unwrap();
+        let out = activity_power_zone_stats("i1", &details, &streams, 4, None, None, None).unwrap();
         let z5 = out["zones"]
             .as_array()
             .unwrap()
@@ -1995,9 +2349,16 @@ mod tests {
         let bounds = vec![50.0, 100.0, 999.0];
         let labels = vec!["Easy".to_string(), "Work".to_string(), "Hard".to_string()];
 
-        let out =
-            activity_power_zone_stats("i1", &details, &streams, 1, Some(&bounds), Some(&labels))
-                .unwrap();
+        let out = activity_power_zone_stats(
+            "i1",
+            &details,
+            &streams,
+            1,
+            Some(&bounds),
+            Some(&labels),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(out["zone_model"], "custom_power_zones");
         assert_eq!(out["zone_source"], "custom.zone_bounds_percent");
@@ -2024,10 +2385,135 @@ mod tests {
         });
         let bounds = vec![54.0, 54.0, 999.0];
 
-        let err = activity_power_zone_stats("i1", &details, &streams, 1, Some(&bounds), None)
+        let err = activity_power_zone_stats("i1", &details, &streams, 1, Some(&bounds), None, None)
             .unwrap_err();
 
         assert!(err.contains("strictly increasing"));
+    }
+
+    #[test]
+    fn activity_power_zone_stats_applies_elapsed_window_before_moving_mask() {
+        let details = serde_json::json!({
+            "id": "i1",
+            "icu_ftp": 100,
+            "elapsed_time": 6,
+            "moving_time": 4,
+            "icu_power_zones": [54, 75, 87, 94, 105, 120, 999]
+        });
+        let streams = serde_json::json!({
+            "streams": [
+                {"type": "time", "data": [0, 1, 2, 3, 4, 5]},
+                {"type": "watts", "data": [50, 100, 100, 100, 100, 100]},
+                {"type": "velocity_smooth", "data": [2.0, 2.0, 0.0, 2.0, 2.0, 0.0]}
+            ]
+        });
+        let window = ActivityPowerZoneStatsWindow {
+            window_type: Some("elapsed_time".to_string()),
+            start: serde_json::json!(1),
+            end: serde_json::json!(5),
+        };
+
+        let out = activity_power_zone_stats("i1", &details, &streams, 1, None, None, Some(&window))
+            .unwrap();
+
+        assert_eq!(out["window"]["type"], "elapsed_time");
+        assert_eq!(out["window"]["start_index"], 1);
+        assert_eq!(out["window"]["end_index"], 5);
+        assert_eq!(out["total_elapsed_seconds"], 4);
+        assert_eq!(out["included_seconds"], 3);
+        assert_eq!(out["excluded_seconds"], 1);
+        assert_eq!(out["include_filter"], "window_and_velocity_smooth_gt_0");
+        assert_eq!(out["movement_seconds"], 3);
+        let z5 = out["zones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|zone| zone["zone"] == "Z5")
+            .unwrap();
+        assert_eq!(z5["seconds"], 3);
+    }
+
+    #[test]
+    fn activity_power_zone_stats_supports_moving_time_window() {
+        let details = serde_json::json!({
+            "id": "i1",
+            "icu_ftp": 100,
+            "elapsed_time": 6,
+            "moving_time": 4,
+            "icu_power_zones": [54, 75, 87, 94, 105, 120, 999]
+        });
+        let streams = serde_json::json!({
+            "streams": [
+                {"type": "time", "data": [0, 1, 2, 3, 4, 5]},
+                {"type": "watts", "data": [100, 100, 50, 100, 100, 50]},
+                {"type": "velocity_smooth", "data": [2.0, 2.0, 0.0, 2.0, 2.0, 0.0]}
+            ]
+        });
+        let window = ActivityPowerZoneStatsWindow {
+            window_type: Some("moving_time".to_string()),
+            start: serde_json::json!(1),
+            end: serde_json::json!(3),
+        };
+
+        let out = activity_power_zone_stats("i1", &details, &streams, 1, None, None, Some(&window))
+            .unwrap();
+
+        assert_eq!(out["window"]["type"], "moving_time");
+        assert_eq!(out["window"]["available_moving_seconds"], 4);
+        assert_eq!(out["window"]["moving_seconds"], 2);
+        assert_eq!(out["window"]["points"], 3);
+        assert_eq!(out["window"]["moving_points"], 2);
+        assert_eq!(out["total_elapsed_seconds"], 3);
+        assert_eq!(out["included_seconds"], 2);
+        assert_eq!(out["excluded_seconds"], 1);
+        let z5 = out["zones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|zone| zone["zone"] == "Z5")
+            .unwrap();
+        assert_eq!(z5["seconds"], 2);
+    }
+
+    #[test]
+    fn activity_power_zone_stats_supports_distance_window() {
+        let details = serde_json::json!({
+            "id": "i1",
+            "icu_ftp": 100,
+            "elapsed_time": 6,
+            "moving_time": 4,
+            "icu_power_zones": [54, 75, 87, 94, 105, 120, 999]
+        });
+        let streams = serde_json::json!({
+            "streams": [
+                {"type": "time", "data": [0, 1, 2, 3, 4, 5]},
+                {"type": "distance", "data": [0, 100, 200, 300, 400, 500]},
+                {"type": "watts", "data": [50, 100, 100, 100, 100, 50]},
+                {"type": "velocity_smooth", "data": [2.0, 2.0, 0.0, 2.0, 2.0, 0.0]}
+            ]
+        });
+        let window = ActivityPowerZoneStatsWindow {
+            window_type: Some("distance".to_string()),
+            start: serde_json::json!(100),
+            end: serde_json::json!(400),
+        };
+
+        let out = activity_power_zone_stats("i1", &details, &streams, 1, None, None, Some(&window))
+            .unwrap();
+
+        assert_eq!(out["window"]["type"], "distance");
+        assert_eq!(out["window"]["start_index"], 1);
+        assert_eq!(out["window"]["end_index"], 4);
+        assert_eq!(out["total_elapsed_seconds"], 3);
+        assert_eq!(out["included_seconds"], 2);
+        assert_eq!(out["excluded_seconds"], 1);
+        let z5 = out["zones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|zone| zone["zone"] == "Z5")
+            .unwrap();
+        assert_eq!(z5["seconds"], 2);
     }
 
     #[test]

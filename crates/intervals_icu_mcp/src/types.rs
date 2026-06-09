@@ -199,12 +199,28 @@ pub struct ActivityPowerZoneStatsParams {
     pub activity_id: String,
     /// Minimum zone seconds before response stats are considered valid (default: 30).
     pub min_response_seconds: Option<u32>,
+    /// Optional window to analyze before applying the movement mask.
+    /// Supported types: elapsed_time, moving_time, distance. moving_time resolves elapsed-stream
+    /// start/end indices from cumulative moving seconds, then applies the movement mask inside it.
+    pub window: Option<ActivityPowerZoneStatsWindow>,
     /// Optional Intervals-style inclusive upper power-zone bounds as percent of FTP.
     /// Must be strictly increasing and end with an open sentinel such as 999.
     /// Example: [54,75,87,94,105,120,999].
     pub zone_bounds_percent: Option<Vec<f64>>,
     /// Optional labels for zone_bounds_percent, in the same order.
     pub zone_labels: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[schemars(inline)]
+pub struct ActivityPowerZoneStatsWindow {
+    /// Window type: elapsed_time, moving_time, or distance. Default: elapsed_time.
+    #[serde(rename = "type")]
+    pub window_type: Option<String>,
+    /// Start boundary. Use seconds or HH:MM:SS for time windows; meters for distance.
+    pub start: serde_json::Value,
+    /// Exclusive end boundary. Use seconds or HH:MM:SS for time windows; meters for distance.
+    pub end: serde_json::Value,
 }
 
 /// Parameters for get_best_efforts with compact mode
