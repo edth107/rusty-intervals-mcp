@@ -293,7 +293,7 @@ async fn integration_get_activity_intervals() {
 #[ignore = "requires real API credentials"]
 async fn integration_get_power_curves() {
     let client = create_client();
-    let result = client.get_power_curves(Some(90), "Ride").await;
+    let result = client.get_power_curves(Some(90), "Ride", None).await;
 
     assert!(
         result.is_ok(),

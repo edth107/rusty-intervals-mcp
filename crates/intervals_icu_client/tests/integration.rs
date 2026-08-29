@@ -859,7 +859,7 @@ async fn power_curves_and_histogram_ok() {
         SecretString::new("tok".into()),
     );
     let c = client
-        .get_power_curves(Some(30), "Ride")
+        .get_power_curves(Some(30), "Ride", None)
         .await
         .expect("curves");
     assert!(c.get("best").is_some());

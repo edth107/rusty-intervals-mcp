@@ -141,6 +141,7 @@ impl IntervalsClient for LocalMockClient {
         &self,
         _days_back: Option<i32>,
         _sport: &str,
+        _date_range: Option<&str>,
     ) -> Result<serde_json::Value, intervals_icu_client::IntervalsError> {
         Ok(serde_json::json!({}))
     }

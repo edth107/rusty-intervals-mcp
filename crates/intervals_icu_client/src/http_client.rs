@@ -409,6 +409,23 @@ impl IntervalsClient for ReqwestIntervalsClient {
         self.execute_json(self.get_request(&url)).await
     }
 
+    async fn update_activity_intervals(
+        &self,
+        activity_id: &str,
+        intervals: &[crate::ActivityIntervalInput],
+    ) -> Result<serde_json::Value, IntervalsError> {
+        let url = format!(
+            "{}/api/v1/activity/{}/intervals",
+            self.base_url, activity_id
+        );
+        self.execute_json(
+            self.put_request(&url)
+                .query(&[("all", "false")])
+                .json(intervals),
+        )
+        .await
+    }
+
     async fn get_best_efforts(
         &self,
         activity_id: &str,

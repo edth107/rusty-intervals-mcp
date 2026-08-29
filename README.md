@@ -19,10 +19,10 @@ Standard MCP servers often overwhelm LLMs with raw, verbose data, consuming thou
 
 ## Overview
 
-This MCP server provides **58 tools** to interact with your Intervals.icu account, organized into 9 categories:
+This MCP server provides **59 tools** to interact with your Intervals.icu account, organized into 9 categories:
 
 - **Activities** (11 tools) - Query, search, update, delete, and download activities
-- **Activity Analysis** (9 tools) - Deep dive into streams, zones, intervals, best efforts, and histograms
+- **Activity Analysis** (10 tools) - Deep dive into streams, zones, intervals, best efforts, and histograms
 - **Athlete** (2 tools) - Access profile, fitness metrics, and training load
 - **Wellness** (3 tools) - Track and update recovery, HRV, sleep, and health metrics
 - **Events/Calendar** (9 tools) - Manage planned workouts, races, notes with bulk operations
@@ -457,6 +457,24 @@ With `summary=false`, returns `total_count`, `returned_count`, `zone_type`, and 
 {"activity_id": "i123", "summary": false, "max_intervals": 100}
 ```
 
+#### `create_activity_intervals` (write tool)
+
+Adds named interval annotations to an existing activity. The original FIT/Wahoo file and raw
+streams are not modified. Existing intervals are preserved because the server always calls the
+Intervals.icu API with `all=false`; replacement and deletion are not exposed by this tool.
+
+Each interval requires zero-based `start_index`, exclusive `end_index`, a non-empty `label`, and
+optionally `type` (`WORK`, the default, or `RECOVERY`). The write is blocked unless the MCP process
+is started with the explicit one-shot override:
+
+```bash
+INTERVALS_ICU_ALLOW_ACTIVITY_INTERVAL_WRITES=I_UNDERSTAND_THIS_MUTATES_INTERVALS_ICU \
+  mcporter call intervals.create_activity_intervals --args \
+  '{"activity_id":"i123","intervals":[{"start_index":120,"end_index":480,"label":"Climb","type":"WORK"}]}'
+```
+
+Without that environment variable the tool returns an error before issuing any PUT request.
+
 #### `get_activity_power_zone_stats`
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -531,12 +549,13 @@ Returns raw-stream power-zone distribution plus per-zone response stats. By defa
 | `download_fit_file` | Download activity as FIT file |
 | `download_gpx_file` | Download activity as GPX file |
 
-### Activity Analysis (9 tools)
+### Activity Analysis (10 tools)
 
 | Tool | Description |
 |------|-------------|
 | `get_activity_streams` | Get time-series data with compact options (`max_points`, `summary`, `streams`) |
 | `get_activity_intervals` | Get structured workout intervals as summaries or window-ready compact intervals |
+| `create_activity_intervals` | Add named activity intervals; requires an explicit write override and always preserves existing intervals |
 | `get_activity_power_zone_stats` | Get power-zone distribution and response stats for an activity |
 | `get_best_efforts` | Find peak performances across all durations in an activity |
 | `search_intervals` | Find similar intervals across activity history |

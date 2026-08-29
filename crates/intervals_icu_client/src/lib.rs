@@ -87,6 +87,48 @@ pub struct ActivitySummary {
     pub name: Option<String>,
 }
 
+/// User-defined interval boundaries accepted by the Intervals.icu activity API.
+///
+/// Indices refer to the activity stream and `end_index` is exclusive.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+pub struct ActivityIntervalInput {
+    pub start_index: i32,
+    pub end_index: i32,
+    pub label: String,
+    #[serde(rename = "type", default)]
+    #[schemars(default)]
+    pub interval_type: ActivityIntervalType,
+}
+
+impl ActivityIntervalInput {
+    pub fn validate(&self) -> Result<(), IntervalsError> {
+        if self.start_index < 0 {
+            return Err(IntervalsError::InvalidInput(
+                "start_index must be non-negative".into(),
+            ));
+        }
+        if self.end_index <= self.start_index {
+            return Err(IntervalsError::InvalidInput(
+                "end_index must be greater than start_index (end is exclusive)".into(),
+            ));
+        }
+        if self.label.trim().is_empty() {
+            return Err(IntervalsError::InvalidInput(
+                "interval label must not be empty".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ActivityIntervalType {
+    #[default]
+    Work,
+    Recovery,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EventCategory {
@@ -166,6 +208,15 @@ pub trait IntervalsClient: Send + Sync + 'static {
         &self,
         activity_id: &str,
     ) -> Result<serde_json::Value, IntervalsError>;
+    async fn update_activity_intervals(
+        &self,
+        _activity_id: &str,
+        _intervals: &[ActivityIntervalInput],
+    ) -> Result<serde_json::Value, IntervalsError> {
+        Err(IntervalsError::InvalidInput(
+            "activity interval writes are not implemented by this client".into(),
+        ))
+    }
     /// Find best efforts in an activity.
     ///
     /// If `options` is `Some` it is treated as an explicit query; `stream` must be supplied

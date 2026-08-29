@@ -83,6 +83,18 @@ impl intervals_icu_client::IntervalsClient for MockClient {
         Ok(json!({ "intervals": [{ "start": 0, "end": 60 }] }))
     }
 
+    async fn update_activity_intervals(
+        &self,
+        activity_id: &str,
+        intervals: &[intervals_icu_client::ActivityIntervalInput],
+    ) -> Result<serde_json::Value, intervals_icu_client::IntervalsError> {
+        Ok(json!({
+            "activity_id": activity_id,
+            "all": false,
+            "intervals": intervals,
+        }))
+    }
+
     async fn get_best_efforts(
         &self,
         _activity_id: &str,

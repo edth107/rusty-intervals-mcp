@@ -15,6 +15,9 @@ use rmcp::{prompt, prompt_handler, prompt_router, tool, tool_router};
 
 use intervals_icu_client::{ActivitySummary, IntervalsClient};
 
+const ACTIVITY_INTERVAL_WRITES_ENV: &str = "INTERVALS_ICU_ALLOW_ACTIVITY_INTERVAL_WRITES";
+const ACTIVITY_INTERVAL_WRITES_TOKEN: &str = "I_UNDERSTAND_THIS_MUTATES_INTERVALS_ICU";
+
 // Import DRY helpers
 use crate::compact::{ToToolError, apply_compact_mode, apply_compact_mode_with_filter};
 
@@ -37,6 +40,7 @@ pub use types::*;
 #[derive(Clone)]
 pub struct IntervalsMcpHandler {
     client: Arc<dyn IntervalsClient>,
+    allow_activity_interval_writes: bool,
     tool_router: rmcp::handler::server::tool::ToolRouter<IntervalsMcpHandler>,
     prompt_router: rmcp::handler::server::router::prompt::PromptRouter<IntervalsMcpHandler>,
     downloads: Arc<Mutex<HashMap<String, DownloadStatus>>>,
@@ -57,8 +61,18 @@ impl IntervalsMcpHandler {
     }
 
     pub fn new(client: Arc<dyn IntervalsClient>) -> Self {
+        let allow_activity_interval_writes = std::env::var(ACTIVITY_INTERVAL_WRITES_ENV)
+            .is_ok_and(|value| value == ACTIVITY_INTERVAL_WRITES_TOKEN);
+        Self::new_with_activity_interval_writes(client, allow_activity_interval_writes)
+    }
+
+    fn new_with_activity_interval_writes(
+        client: Arc<dyn IntervalsClient>,
+        allow_activity_interval_writes: bool,
+    ) -> Self {
         Self {
             client,
+            allow_activity_interval_writes,
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
             downloads: Arc::new(Mutex::new(HashMap::new())),
@@ -520,9 +534,7 @@ impl IntervalsMcpHandler {
             return stream_filter;
         }
 
-        let Some(mut streams) = stream_filter else {
-            return None;
-        };
+        let mut streams = stream_filter?;
 
         if !streams
             .iter()
@@ -624,6 +636,53 @@ impl IntervalsMcpHandler {
         );
 
         Ok(Json(ObjectResult { value: result }))
+    }
+
+    #[tool(
+        name = "create_activity_intervals",
+        description = "WRITE TOOL: Add named intervals to an existing Intervals.icu activity. This mutates only the activity's stored interval annotations; it does not alter the original FIT/Wahoo file or raw streams. Each interval uses zero-based activity-stream start_index and exclusive end_index, a non-empty label, and type WORK (default) or RECOVERY. Existing intervals are preserved because the API is always called with all=false; replacement and deletion are intentionally not exposed. The write is blocked unless the MCP process is started with INTERVALS_ICU_ALLOW_ACTIVITY_INTERVAL_WRITES=I_UNDERSTAND_THIS_MUTATES_INTERVALS_ICU. Use only after the target activity and exact stream boundaries have been verified.",
+        annotations(
+            title = "Create activity intervals",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn create_activity_intervals(
+        &self,
+        params: Parameters<CreateActivityIntervalsParams>,
+    ) -> Result<Json<ObjectResult>, String> {
+        if !self.allow_activity_interval_writes {
+            return Err(format!(
+                "activity interval writes are blocked; start this MCP invocation with {ACTIVITY_INTERVAL_WRITES_ENV}={ACTIVITY_INTERVAL_WRITES_TOKEN} to allow this Intervals.icu mutation"
+            ));
+        }
+
+        let mut p = params.0;
+        if !p.activity_id.strip_prefix('i').is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
+        }) {
+            return Err("activity_id must use the Intervals.icu form i<digits>".into());
+        }
+
+        if p.intervals.is_empty() {
+            return Err("intervals must contain at least one interval".into());
+        }
+        for (index, interval) in p.intervals.iter_mut().enumerate() {
+            interval
+                .validate()
+                .map_err(|error| format!("invalid interval at index {index}: {error}"))?;
+            interval.label = interval.label.trim().to_string();
+        }
+
+        let value = self
+            .client
+            .update_activity_intervals(&p.activity_id, &p.intervals)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        Ok(Json(ObjectResult { value }))
     }
 
     /// Transform intervals: summarize or limit and filter fields
@@ -2155,6 +2214,7 @@ mod tests {
                 .any(|t| t.name == "get_activity_power_zone_stats")
         );
         assert!(tools.iter().any(|t| t.name == "get_activity_intervals"));
+        assert!(tools.iter().any(|t| t.name == "create_activity_intervals"));
         assert!(tools.iter().any(|t| t.name == "get_best_efforts"));
         assert!(tools.iter().any(|t| t.name == "download_fit_file"));
         assert!(tools.iter().any(|t| t.name == "download_gpx_file"));
@@ -2199,7 +2259,78 @@ mod tests {
         assert!(tools.iter().any(|t| t.name == "update_folder"));
         assert!(tools.iter().any(|t| t.name == "delete_folder"));
         // Ensure the number of registered tools matches the documented implementation
-        assert_eq!(handler.tool_count(), 58, "Should register 58 tools");
+        assert_eq!(handler.tool_count(), 59, "Should register 59 tools");
+    }
+
+    #[test]
+    fn create_activity_intervals_schema_warns_about_the_write() {
+        let handler =
+            IntervalsMcpHandler::new_with_activity_interval_writes(Arc::new(MockClient), false);
+        let tool = handler
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "create_activity_intervals")
+            .expect("create_activity_intervals tool present");
+        let description = tool.description.expect("write description");
+        assert!(description.contains("WRITE TOOL"));
+        assert!(description.contains(ACTIVITY_INTERVAL_WRITES_ENV));
+        assert!(description.contains("all=false"));
+        let annotations = tool.annotations.expect("write annotations");
+        assert_eq!(annotations.read_only_hint, Some(false));
+        assert_eq!(annotations.destructive_hint, Some(false));
+    }
+
+    fn test_activity_interval_params() -> CreateActivityIntervalsParams {
+        CreateActivityIntervalsParams {
+            activity_id: "i123".into(),
+            intervals: vec![intervals_icu_client::ActivityIntervalInput {
+                start_index: 100,
+                end_index: 200,
+                label: "  KRM Horn  ".into(),
+                interval_type: intervals_icu_client::ActivityIntervalType::Work,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn create_activity_intervals_is_blocked_without_write_flag() {
+        let handler =
+            IntervalsMcpHandler::new_with_activity_interval_writes(Arc::new(MockClient), false);
+        let error = match handler
+            .create_activity_intervals(Parameters(test_activity_interval_params()))
+            .await
+        {
+            Ok(_) => panic!("write must be blocked"),
+            Err(error) => error,
+        };
+        assert!(error.contains(ACTIVITY_INTERVAL_WRITES_ENV));
+    }
+
+    #[tokio::test]
+    async fn create_activity_intervals_writes_when_flag_is_enabled() {
+        let handler =
+            IntervalsMcpHandler::new_with_activity_interval_writes(Arc::new(MockClient), true);
+        let result = handler
+            .create_activity_intervals(Parameters(test_activity_interval_params()))
+            .await
+            .expect("write allowed");
+        assert_eq!(result.0.value["activity_id"], "i123");
+        assert_eq!(result.0.value["all"], false);
+        assert_eq!(result.0.value["intervals"][0]["label"], "KRM Horn");
+    }
+
+    #[tokio::test]
+    async fn create_activity_intervals_rejects_invalid_activity_id() {
+        let handler =
+            IntervalsMcpHandler::new_with_activity_interval_writes(Arc::new(MockClient), true);
+        let mut params = test_activity_interval_params();
+        params.activity_id = "123".into();
+        let error = match handler.create_activity_intervals(Parameters(params)).await {
+            Ok(_) => panic!("invalid id must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("i<digits>"));
     }
 
     #[test]
@@ -3794,6 +3925,17 @@ mod tests {
             _activity_id: &str,
         ) -> Result<serde_json::Value, intervals_icu_client::IntervalsError> {
             Ok(serde_json::json!({ "intervals": [{ "start": 0, "end": 60 }] }))
+        }
+        async fn update_activity_intervals(
+            &self,
+            activity_id: &str,
+            intervals: &[intervals_icu_client::ActivityIntervalInput],
+        ) -> Result<serde_json::Value, intervals_icu_client::IntervalsError> {
+            Ok(serde_json::json!({
+                "activity_id": activity_id,
+                "all": false,
+                "intervals": intervals,
+            }))
         }
         async fn get_best_efforts(
             &self,
@@ -7357,7 +7499,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_descriptions_are_concise() {
+    fn tool_descriptions_are_concise_except_explicit_write_warnings() {
         let client =
             ReqwestIntervalsClient::new("http://localhost", "ath", SecretString::new("key".into()));
         let handler = IntervalsMcpHandler::new(Arc::new(client));
@@ -7365,11 +7507,21 @@ mod tests {
 
         for tool in tools {
             let desc_len = tool.description.as_ref().map(|d| d.len()).unwrap_or(0);
+            let max_len = if tool
+                .annotations
+                .as_ref()
+                .is_some_and(|annotations| annotations.read_only_hint == Some(false))
+            {
+                800
+            } else {
+                200
+            };
             assert!(
-                desc_len < 200,
-                "Tool '{}' description too long: {} chars (max 200)",
+                desc_len < max_len,
+                "Tool '{}' description too long: {} chars (max {})",
                 tool.name,
-                desc_len
+                desc_len,
+                max_len
             );
         }
     }

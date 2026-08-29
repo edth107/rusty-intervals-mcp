@@ -130,7 +130,7 @@ fn transform_fitness_summary(arr: &[Value]) -> Option<Value> {
         }
     }
 
-    if days.is_empty() || !days[0].get("ctl").is_some() {
+    if days.is_empty() || days[0].get("ctl").is_none() {
         return None;
     }
 

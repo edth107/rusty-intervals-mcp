@@ -23,6 +23,6 @@ async fn get_power_curves_normalizes_type_and_sends_curves() {
         "test_ath",
         SecretString::new("key".into()),
     );
-    let res: serde_json::Value = client.get_power_curves(Some(7), "run").await.unwrap();
+    let res: serde_json::Value = client.get_power_curves(Some(7), "run", None).await.unwrap();
     assert_eq!(res, serde_json::json!({"ok": true}));
 }

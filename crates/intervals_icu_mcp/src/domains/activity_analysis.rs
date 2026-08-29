@@ -28,29 +28,19 @@ pub fn transform_streams(
 ) -> Value {
     match value {
         Value::Array(streams) if is_stream_list(&streams) => {
-            return transform_stream_list(
-                streams,
-                max_points,
-                summary_only,
-                filter_streams.as_deref(),
-            );
+            transform_stream_list(streams, max_points, summary_only, filter_streams.as_deref())
         }
         Value::Object(mut obj) => {
             if let Some(streams) = obj.remove("streams") {
                 let transformed =
                     transform_streams(streams, max_points, summary_only, filter_streams);
                 obj.insert("streams".to_string(), transformed);
-                return Value::Object(obj);
+                Value::Object(obj)
+            } else {
+                transform_stream_object(obj, max_points, summary_only, filter_streams.as_deref())
             }
-
-            return transform_stream_object(
-                obj,
-                max_points,
-                summary_only,
-                filter_streams.as_deref(),
-            );
         }
-        other => return other,
+        other => other,
     }
 }
 
@@ -1934,30 +1924,28 @@ pub fn transform_curves(value: &Value, summary_only: bool, durations: Option<&[u
         return Value::Object(result);
     }
 
-    if summary_only {
-        if let Some(obj) = value.as_object() {
-            let mut result = Map::new();
-            for (key, val) in obj {
-                if let Some(arr) = val.as_array() {
-                    let filtered: Vec<&Value> = arr
-                        .iter()
-                        .filter(|item| {
-                            item.get("secs")
-                                .and_then(|s| s.as_u64())
-                                .map(|s| KEY_DURATIONS.contains(&(s as u32)))
-                                .unwrap_or(false)
-                        })
-                        .collect();
-                    result.insert(
-                        key.clone(),
-                        Value::Array(filtered.into_iter().cloned().collect()),
-                    );
-                } else {
-                    result.insert(key.clone(), val.clone());
-                }
+    if summary_only && let Some(obj) = value.as_object() {
+        let mut result = Map::new();
+        for (key, val) in obj {
+            if let Some(arr) = val.as_array() {
+                let filtered: Vec<&Value> = arr
+                    .iter()
+                    .filter(|item| {
+                        item.get("secs")
+                            .and_then(|s| s.as_u64())
+                            .map(|s| KEY_DURATIONS.contains(&(s as u32)))
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                result.insert(
+                    key.clone(),
+                    Value::Array(filtered.into_iter().cloned().collect()),
+                );
+            } else {
+                result.insert(key.clone(), val.clone());
             }
-            return Value::Object(result);
         }
+        return Value::Object(result);
     }
 
     value.clone()
