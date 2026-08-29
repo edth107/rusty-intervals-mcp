@@ -192,12 +192,12 @@ pub struct ActivityIntervalsParams {
     pub fields: Option<Vec<String>>,
 }
 
-/// Parameters for additive activity interval creation.
+/// Parameters for activity interval creation in Intervals.icu merge mode.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct CreateActivityIntervalsParams {
     /// Intervals.icu activity ID, including its leading `i`.
     pub activity_id: String,
-    /// Named intervals to add. Existing intervals are preserved.
+    /// Named intervals to add. Overlaps can resegment existing intervals.
     pub intervals: Vec<intervals_icu_client::ActivityIntervalInput>,
 }
 

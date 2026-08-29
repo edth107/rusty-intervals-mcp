@@ -6,7 +6,7 @@ Current status:
 - Implements an `IntervalsMcpHandler` with many tools exposed via `rmcp` including:
 	- Athlete/profile: `get_athlete_profile`
 	- Activities: `get_recent_activities`, `get_activity_details`, `search_activities`, `update_activity`
-	- Activity interval writes: `create_activity_intervals` is additive (`all=false`) and requires `INTERVALS_ICU_ALLOW_ACTIVITY_INTERVAL_WRITES=I_UNDERSTAND_THIS_MUTATES_INTERVALS_ICU`
+	- Activity interval writes: `create_activity_intervals` uses merge mode (`all=false`), may resegment overlaps, and requires `INTERVALS_ICU_ALLOW_ACTIVITY_INTERVAL_WRITES=I_UNDERSTAND_THIS_MUTATES_INTERVALS_ICU`
 	- Events: `get_events`, `create_event`, `get_event`, `delete_event`, `bulk_create_events`
 	- Streams & intervals: `get_activity_streams`, `get_activity_intervals`, `get_activity_power_zone_stats`, `get_best_efforts`
 	- Files: `start_download`, `get_download_status`, `list_downloads`, `cancel_download` (progress & cancellation supported)

@@ -460,8 +460,10 @@ With `summary=false`, returns `total_count`, `returned_count`, `zone_type`, and 
 #### `create_activity_intervals` (write tool)
 
 Adds named interval annotations to an existing activity. The original FIT/Wahoo file and raw
-streams are not modified. Existing intervals are preserved because the server always calls the
-Intervals.icu API with `all=false`; replacement and deletion are not exposed by this tool.
+streams are not modified. The server always calls the Intervals.icu API with `all=false`, which
+requests merge mode instead of full replacement. Intervals.icu keeps a non-overlapping interval
+segmentation, so an added interval that overlaps existing intervals can split, merge, or replace
+those annotations.
 
 Each interval requires zero-based `start_index`, exclusive `end_index`, a non-empty `label`, and
 optionally `type` (`WORK`, the default, or `RECOVERY`). The write is blocked unless the MCP process
@@ -555,7 +557,7 @@ Returns raw-stream power-zone distribution plus per-zone response stats. By defa
 |------|-------------|
 | `get_activity_streams` | Get time-series data with compact options (`max_points`, `summary`, `streams`) |
 | `get_activity_intervals` | Get structured workout intervals as summaries or window-ready compact intervals |
-| `create_activity_intervals` | Add named activity intervals; requires an explicit write override and always preserves existing intervals |
+| `create_activity_intervals` | Add named activity intervals in merge mode; requires an explicit write override and may resegment overlaps |
 | `get_activity_power_zone_stats` | Get power-zone distribution and response stats for an activity |
 | `get_best_efforts` | Find peak performances across all durations in an activity |
 | `search_intervals` | Find similar intervals across activity history |

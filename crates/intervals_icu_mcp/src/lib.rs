@@ -640,11 +640,11 @@ impl IntervalsMcpHandler {
 
     #[tool(
         name = "create_activity_intervals",
-        description = "WRITE TOOL: Add named intervals to an existing Intervals.icu activity. This mutates only the activity's stored interval annotations; it does not alter the original FIT/Wahoo file or raw streams. Each interval uses zero-based activity-stream start_index and exclusive end_index, a non-empty label, and type WORK (default) or RECOVERY. Existing intervals are preserved because the API is always called with all=false; replacement and deletion are intentionally not exposed. The write is blocked unless the MCP process is started with INTERVALS_ICU_ALLOW_ACTIVITY_INTERVAL_WRITES=I_UNDERSTAND_THIS_MUTATES_INTERVALS_ICU. Use only after the target activity and exact stream boundaries have been verified.",
+        description = "WRITE TOOL: Add named intervals to an existing Intervals.icu activity. This mutates only stored interval annotations; it does not alter the original FIT/Wahoo file or raw streams. Each interval uses zero-based activity-stream start_index and exclusive end_index, a non-empty label, and type WORK (default) or RECOVERY. The API is always called with all=false (merge mode), never full replacement. Intervals.icu keeps a non-overlapping segmentation, so a new interval that overlaps existing intervals can split, merge, or replace those annotations. The write is blocked unless the MCP process is started with INTERVALS_ICU_ALLOW_ACTIVITY_INTERVAL_WRITES=I_UNDERSTAND_THIS_MUTATES_INTERVALS_ICU. Verify the target and exact boundaries first.",
         annotations(
             title = "Create activity intervals",
             read_only_hint = false,
-            destructive_hint = false,
+            destructive_hint = true,
             idempotent_hint = false,
             open_world_hint = true
         )
@@ -2263,7 +2263,7 @@ mod tests {
     }
 
     #[test]
-    fn create_activity_intervals_schema_warns_about_the_write() {
+    fn create_activity_intervals_schema_warns_about_resegmentation() {
         let handler =
             IntervalsMcpHandler::new_with_activity_interval_writes(Arc::new(MockClient), false);
         let tool = handler
@@ -2276,9 +2276,10 @@ mod tests {
         assert!(description.contains("WRITE TOOL"));
         assert!(description.contains(ACTIVITY_INTERVAL_WRITES_ENV));
         assert!(description.contains("all=false"));
+        assert!(description.contains("split, merge, or replace"));
         let annotations = tool.annotations.expect("write annotations");
         assert_eq!(annotations.read_only_hint, Some(false));
-        assert_eq!(annotations.destructive_hint, Some(false));
+        assert_eq!(annotations.destructive_hint, Some(true));
     }
 
     fn test_activity_interval_params() -> CreateActivityIntervalsParams {
