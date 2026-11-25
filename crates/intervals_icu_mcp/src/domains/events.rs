@@ -4,7 +4,16 @@ use serde_json::{Map, Value};
 pub use crate::transforms::{normalize_date_str, normalize_event_start};
 
 /// Default fields for compact event listings
-const DEFAULT_COMPACT_FIELDS: &[&str] = &["id", "start_date_local", "name", "category", "type"];
+const DEFAULT_COMPACT_FIELDS: &[&str] = &[
+    "id",
+    "start_date_local",
+    "name",
+    "category",
+    "type",
+    "icu_training_load",
+    "moving_time",
+    "not_on_fitness_chart",
+];
 
 /// Default fields for full event details
 const DEFAULT_EVENT_FIELDS: &[&str] = &[
@@ -14,6 +23,9 @@ const DEFAULT_EVENT_FIELDS: &[&str] = &[
     "category",
     "type",
     "description",
+    "icu_training_load",
+    "moving_time",
+    "not_on_fitness_chart",
 ];
 
 pub fn compact_events(
@@ -400,5 +412,31 @@ mod tests {
             Some(99),
             "extra preserved in non-compact mode"
         );
+    }
+
+    #[test]
+    fn compact_event_rows_retain_optional_planning_fields_without_summary() {
+        use serde_json::json;
+        let input = json!([
+            {
+                "id": "e1",
+                "name": "Endurance",
+                "start_date_local": "2026-11-25T10:00:00",
+                "category": "WORKOUT",
+                "type": "Ride",
+                "icu_training_load": 64.5,
+                "moving_time": 5400,
+                "not_on_fitness_chart": true,
+                "workout_doc": {"steps": []}
+            }
+        ]);
+
+        let result = compact_events_from_value(&input, true, 50, None);
+        let rows = result.as_array().expect("separate event rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["icu_training_load"], 64.5);
+        assert_eq!(rows[0]["moving_time"], 5400);
+        assert_eq!(rows[0]["not_on_fitness_chart"], true);
+        assert!(rows[0].get("workout_doc").is_none());
     }
 }

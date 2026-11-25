@@ -9,6 +9,23 @@ pub struct RecentParams {
     pub days_back: Option<i32>,
 }
 
+/// Full activity rows for an optional inclusive local-date range.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct ActivitiesParams {
+    /// Inclusive local start date (YYYY-MM-DD); provide together with `to`.
+    pub from: Option<String>,
+    /// Inclusive local end date (YYYY-MM-DD); provide together with `from`.
+    pub to: Option<String>,
+    /// Activity sport/type filter, matched case-insensitively (for example Ride).
+    pub sport: Option<String>,
+    /// Maximum rows to return (default: 50).
+    pub limit: Option<u32>,
+    /// Return compact rows (default: true).
+    pub compact: Option<bool>,
+    /// Specific fields to return per row.
+    pub fields: Option<Vec<String>>,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ProfileResult {
     pub id: String,
@@ -350,8 +367,14 @@ pub struct FitnessSummaryParams {
 /// Parameters for get_events with compact mode
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct EventsParams {
-    /// Days back (default: 30)
+    /// Days back (default: 30). Ignored when from/to are supplied.
     pub days_back: Option<i32>,
+    /// Inclusive local start date (YYYY-MM-DD); provide together with `to`.
+    pub from: Option<String>,
+    /// Inclusive local end date (YYYY-MM-DD); provide together with `from`.
+    pub to: Option<String>,
+    /// Event sport/type filter, matched case-insensitively (for example Ride).
+    pub sport: Option<String>,
     /// Maximum events to return (default: 50)
     pub limit: Option<u32>,
     /// Return compact summaries (default: true)

@@ -5,7 +5,7 @@
 use crate::{AthleteProfile, IntervalsClient, IntervalsError};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use chrono::{Duration, Utc};
+use chrono::{Duration, NaiveDate, Utc};
 use futures_util::StreamExt;
 use secrecy::{ExposeSecret, SecretString};
 use std::path::PathBuf;
@@ -60,6 +60,59 @@ impl ReqwestIntervalsClient {
     /// This is a helper to avoid repeating the conversion from Vec<(&str, String)> to Vec<(&str, &str)>.
     fn build_query<'a>(&'a self, params: &'a [(&str, String)]) -> Vec<(&'a str, &'a str)> {
         params.iter().map(|(k, v)| (*k, v.as_str())).collect()
+    }
+
+    fn validate_local_date_range(
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<Option<(NaiveDate, NaiveDate)>, IntervalsError> {
+        match (from, to) {
+            (None, None) => Ok(None),
+            (Some(from), Some(to)) => {
+                let from = NaiveDate::parse_from_str(from, "%Y-%m-%d").map_err(|_| {
+                    IntervalsError::InvalidInput(
+                        "from must be a local date in YYYY-MM-DD format".into(),
+                    )
+                })?;
+                let to = NaiveDate::parse_from_str(to, "%Y-%m-%d").map_err(|_| {
+                    IntervalsError::InvalidInput(
+                        "to must be a local date in YYYY-MM-DD format".into(),
+                    )
+                })?;
+                if from > to {
+                    return Err(IntervalsError::InvalidInput(
+                        "from must be on or before to".into(),
+                    ));
+                }
+                Ok(Some((from, to)))
+            }
+            _ => Err(IntervalsError::InvalidInput(
+                "from and to must be supplied together".into(),
+            )),
+        }
+    }
+
+    fn filter_sport_and_limit(
+        value: serde_json::Value,
+        sport: Option<&str>,
+        limit: Option<u32>,
+    ) -> serde_json::Value {
+        let Some(rows) = value.as_array() else {
+            return value;
+        };
+        let rows = rows
+            .iter()
+            .filter(|row| {
+                sport.is_none_or(|expected| {
+                    row.get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+                })
+            })
+            .take(limit.unwrap_or(u32::MAX) as usize)
+            .cloned()
+            .collect();
+        serde_json::Value::Array(rows)
     }
 
     /// Build an authenticated GET request.
@@ -316,6 +369,37 @@ impl IntervalsClient for ReqwestIntervalsClient {
             .await
     }
 
+    async fn get_activities(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+        sport: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<serde_json::Value, IntervalsError> {
+        let url = self.api_url(&["athlete", &self.athlete_id, "activities"]);
+        let range = Self::validate_local_date_range(from, to)?;
+        let mut pairs: Vec<(&str, String)> = Vec::new();
+        if let Some((from, to)) = range {
+            pairs.push(("oldest", from.to_string()));
+            pairs.push(("newest", to.to_string()));
+        } else {
+            let today = Utc::now().date_naive();
+            pairs.push(("oldest", (today - Duration::days(7)).to_string()));
+            pairs.push(("newest", today.to_string()));
+        }
+        // Intervals.icu currently ignores `type` on these list endpoints, so
+        // sport filtering (and therefore limiting) is deliberately local.
+        if sport.is_none() {
+            if let Some(limit) = limit {
+                pairs.push(("limit", limit.to_string()));
+            }
+        }
+        let value = self
+            .execute_json(self.get_request(&url).query(&self.build_query(&pairs)))
+            .await?;
+        Ok(Self::filter_sport_and_limit(value, sport, limit))
+    }
+
     async fn create_event(&self, event: crate::Event) -> Result<crate::Event, IntervalsError> {
         let url = self.api_url(&["athlete", &self.athlete_id, "events"]);
 
@@ -350,6 +434,11 @@ impl IntervalsClient for ReqwestIntervalsClient {
         })
     }
 
+    async fn get_event_details(&self, event_id: &str) -> Result<serde_json::Value, IntervalsError> {
+        let url = self.api_url(&["athlete", &self.athlete_id, "events", event_id]);
+        self.execute_json(self.get_request(&url)).await
+    }
+
     async fn delete_event(&self, event_id: &str) -> Result<(), IntervalsError> {
         let url = self.api_url(&["athlete", &self.athlete_id, "events", event_id]);
         self.execute_empty(self.delete_request(&url)).await
@@ -370,6 +459,34 @@ impl IntervalsClient for ReqwestIntervalsClient {
         }
         self.execute_json(self.get_request(&url).query(&self.build_query(&pairs)))
             .await
+    }
+
+    async fn get_events_filtered(
+        &self,
+        days_back: Option<i32>,
+        limit: Option<u32>,
+        from: Option<&str>,
+        to: Option<&str>,
+        sport: Option<&str>,
+    ) -> Result<serde_json::Value, IntervalsError> {
+        let url = self.api_url(&["athlete", &self.athlete_id, "events"]);
+        let range = Self::validate_local_date_range(from, to)?;
+        let mut pairs: Vec<(&str, String)> = Vec::new();
+        if let Some((from, to)) = range {
+            pairs.push(("oldest", from.to_string()));
+            pairs.push(("newest", to.to_string()));
+        } else if let Some(days_back) = days_back {
+            pairs.push(("days_back", days_back.to_string()));
+        }
+        if sport.is_none() {
+            if let Some(limit) = limit {
+                pairs.push(("limit", limit.to_string()));
+            }
+        }
+        let value = self
+            .execute_json(self.get_request(&url).query(&self.build_query(&pairs)))
+            .await?;
+        Ok(Self::filter_sport_and_limit(value, sport, limit))
     }
 
     async fn bulk_create_events(

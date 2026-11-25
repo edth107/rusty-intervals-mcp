@@ -127,6 +127,34 @@ impl IntervalsMcpHandler {
     }
 
     #[tool(
+        name = "get_activities",
+        description = "List activity rows. Params: inclusive local from/to pair (YYYY-MM-DD), sport/type, limit (default 50), compact (default true), fields. No range uses the recent 7-day window."
+    )]
+    async fn get_activities(
+        &self,
+        params: Parameters<ActivitiesParams>,
+    ) -> Result<Json<ObjectResult>, String> {
+        let p = params.0;
+        let value = self
+            .client
+            .get_activities(
+                p.from.as_deref(),
+                p.to.as_deref(),
+                p.sport.as_deref(),
+                p.limit.or(Some(50)),
+            )
+            .await
+            .to_tool_error()?;
+        let value = compact::apply_compact_mode(
+            value,
+            p.compact,
+            p.fields,
+            transforms::compact_activities_array,
+        );
+        Ok(Json(ObjectResult { value }))
+    }
+
+    #[tool(
         name = "set_webhook_secret",
         description = "Set HMAC secret for webhook signature verification."
     )]
@@ -147,26 +175,33 @@ impl IntervalsMcpHandler {
 
     #[tool(
         name = "get_events",
-        description = "List calendar events. Params: days_back, limit (default 50), compact (default true), fields (filter)."
+        description = "List calendar event rows. Params: days_back or inclusive local from/to pair, sport/type, limit (default 50), compact (default true), fields. Rows retain load, moving_time, and fitness exclusion."
     )]
     async fn get_events(
         &self,
         params: Parameters<EventsParams>,
     ) -> Result<Json<ObjectResult>, String> {
         let p = params.0;
-        let evs = self
+        let value = self
             .client
-            .get_events(p.days_back, p.limit.or(Some(50)))
+            .get_events_filtered(
+                p.days_back,
+                p.limit.or(Some(50)),
+                p.from.as_deref(),
+                p.to.as_deref(),
+                p.sport.as_deref(),
+            )
             .await
             .to_tool_error()?;
 
-        // Apply compact mode using domain helper
-        let result =
-            domains::events::compact_events(evs, p.compact.unwrap_or(true), p.fields.as_deref());
+        let result = domains::events::compact_events_from_value(
+            &value,
+            p.compact.unwrap_or(true),
+            p.limit.unwrap_or(50) as usize,
+            p.fields.as_deref(),
+        );
 
-        Ok(Json(ObjectResult {
-            value: serde_json::to_value(result).to_tool_error()?,
-        }))
+        Ok(Json(ObjectResult { value: result }))
     }
 
     #[tool(
@@ -228,25 +263,22 @@ impl IntervalsMcpHandler {
     ) -> Result<Json<ObjectResult>, String> {
         let p = params.0;
         let event_id = p.event_id.as_cow().into_owned();
-        let ev = self
+        let mut event = self
             .client
-            .get_event(&event_id)
+            .get_event_details(&event_id)
             .await
-            .map_err(|e| e.to_string())?;
-
-        // Apply compact mode
+            .to_tool_error()?;
+        if let Some(id) = event.get_mut("id") {
+            if id.is_number() {
+                *id = serde_json::Value::String(id.to_string());
+            }
+        }
         let result = if p.compact.unwrap_or(true) {
-            Self::compact_json_event(
-                &serde_json::to_value(&ev).map_err(|e| e.to_string())?,
-                p.fields.as_deref(),
-            )
+            Self::compact_json_event(&event, p.fields.as_deref())
         } else if let Some(ref fields) = p.fields {
-            Self::filter_fields(
-                &serde_json::to_value(&ev).map_err(|e| e.to_string())?,
-                fields,
-            )
+            Self::filter_fields(&event, fields)
         } else {
-            serde_json::to_value(ev).map_err(|e| e.to_string())?
+            event
         };
 
         Ok(Json(ObjectResult { value: result }))
@@ -2203,6 +2235,7 @@ mod tests {
         let tools = handler.tool_router.list_all();
         assert!(tools.iter().any(|t| t.name == "get_athlete_profile"));
         assert!(tools.iter().any(|t| t.name == "get_recent_activities"));
+        assert!(tools.iter().any(|t| t.name == "get_activities"));
         assert!(tools.iter().any(|t| t.name == "get_activity_details"));
         assert!(tools.iter().any(|t| t.name == "search_activities"));
         assert!(tools.iter().any(|t| t.name == "search_activities_full"));
@@ -2259,7 +2292,7 @@ mod tests {
         assert!(tools.iter().any(|t| t.name == "update_folder"));
         assert!(tools.iter().any(|t| t.name == "delete_folder"));
         // Ensure the number of registered tools matches the documented implementation
-        assert_eq!(handler.tool_count(), 59, "Should register 59 tools");
+        assert_eq!(handler.tool_count(), 60, "Should register 60 tools");
     }
 
     #[test]

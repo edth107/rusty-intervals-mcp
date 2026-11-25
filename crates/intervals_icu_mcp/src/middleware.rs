@@ -87,6 +87,27 @@ impl<C: IntervalsClient + 'static> IntervalsClient for LoggingMiddleware<C> {
         .await
     }
 
+    async fn get_activities(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+        sport: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<serde_json::Value, IntervalsError> {
+        let from = from.map(str::to_owned);
+        let to = to.map(str::to_owned);
+        let sport = sport.map(str::to_owned);
+        self.with_logging(
+            |client| async move {
+                client
+                    .get_activities(from.as_deref(), to.as_deref(), sport.as_deref(), limit)
+                    .await
+            },
+            "get_activities",
+        )
+        .await
+    }
+
     async fn create_event(
         &self,
         event: intervals_icu_client::Event,
@@ -109,6 +130,14 @@ impl<C: IntervalsClient + 'static> IntervalsClient for LoggingMiddleware<C> {
         .await
     }
 
+    async fn get_event_details(&self, event_id: &str) -> Result<serde_json::Value, IntervalsError> {
+        self.with_logging(
+            |client| async move { client.get_event_details(event_id).await },
+            "get_event_details",
+        )
+        .await
+    }
+
     async fn delete_event(&self, event_id: &str) -> Result<(), IntervalsError> {
         self.with_logging(
             |client| async move { client.delete_event(event_id).await },
@@ -125,6 +154,34 @@ impl<C: IntervalsClient + 'static> IntervalsClient for LoggingMiddleware<C> {
         self.with_logging(
             |client| async move { client.get_events(days_back, limit).await },
             "get_events",
+        )
+        .await
+    }
+
+    async fn get_events_filtered(
+        &self,
+        days_back: Option<i32>,
+        limit: Option<u32>,
+        from: Option<&str>,
+        to: Option<&str>,
+        sport: Option<&str>,
+    ) -> Result<serde_json::Value, IntervalsError> {
+        let from = from.map(str::to_owned);
+        let to = to.map(str::to_owned);
+        let sport = sport.map(str::to_owned);
+        self.with_logging(
+            |client| async move {
+                client
+                    .get_events_filtered(
+                        days_back,
+                        limit,
+                        from.as_deref(),
+                        to.as_deref(),
+                        sport.as_deref(),
+                    )
+                    .await
+            },
+            "get_events_filtered",
         )
         .await
     }

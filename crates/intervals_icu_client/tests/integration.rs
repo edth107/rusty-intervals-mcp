@@ -1856,3 +1856,107 @@ async fn delete_folder_handles_non_success() {
     let result = client.delete_folder("f1").await;
     assert!(result.is_err());
 }
+
+#[tokio::test]
+async fn get_activities_uses_inclusive_range_and_filters_sport_before_limit() {
+    let server = MockServer::start().await;
+    let body = serde_json::json!([
+        {"id":"run-1","type":"Run","moving_time":1200,"icu_training_load":20.0},
+        {"id":"ride-1","type":"Ride","moving_time":3600,"icu_training_load":55.0},
+        {"id":"ride-2","type":"ride","moving_time":1800,"icu_training_load":30.0}
+    ]);
+    Mock::given(method("GET"))
+        .and(path("/api/v1/athlete/ath/activities"))
+        .and(query_param("oldest", "2026-11-01"))
+        .and(query_param("newest", "2026-11-25"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = intervals_icu_client::http_client::ReqwestIntervalsClient::new(
+        &server.uri(),
+        "ath",
+        SecretString::new("tok".into()),
+    );
+    let rows = client
+        .get_activities(
+            Some("2026-11-01"),
+            Some("2026-11-25"),
+            Some("Ride"),
+            Some(1),
+        )
+        .await
+        .expect("activity rows");
+
+    let rows = rows.as_array().expect("array response");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "ride-1");
+    assert_eq!(rows[0]["moving_time"], 3600);
+    assert_eq!(rows[0]["icu_training_load"], 55.0);
+}
+
+#[tokio::test]
+async fn get_events_filtered_preserves_optional_planning_fields() {
+    let server = MockServer::start().await;
+    let body = serde_json::json!([
+        {"id":1,"name":"Run","start_date_local":"2026-11-02T10:00:00","category":"WORKOUT","type":"Run","moving_time":1800},
+        {"id":2,"name":"Ride","start_date_local":"2026-11-03T10:00:00","category":"WORKOUT","type":"Ride","moving_time":5400,"icu_training_load":72.5,"not_on_fitness_chart":true}
+    ]);
+    Mock::given(method("GET"))
+        .and(path("/api/v1/athlete/ath/events"))
+        .and(query_param("oldest", "2026-11-01"))
+        .and(query_param("newest", "2026-11-30"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = intervals_icu_client::http_client::ReqwestIntervalsClient::new(
+        &server.uri(),
+        "ath",
+        SecretString::new("tok".into()),
+    );
+    let rows = client
+        .get_events_filtered(
+            Some(30),
+            Some(5),
+            Some("2026-11-01"),
+            Some("2026-11-30"),
+            Some("Ride"),
+        )
+        .await
+        .expect("event rows");
+
+    let rows = rows.as_array().expect("array response");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], 2);
+    assert_eq!(rows[0]["moving_time"], 5400);
+    assert_eq!(rows[0]["icu_training_load"], 72.5);
+    assert_eq!(rows[0]["not_on_fitness_chart"], true);
+}
+
+#[tokio::test]
+async fn range_queries_reject_partial_or_reversed_local_dates() {
+    let client = intervals_icu_client::http_client::ReqwestIntervalsClient::new(
+        "http://127.0.0.1:9",
+        "ath",
+        SecretString::new("tok".into()),
+    );
+
+    let partial = client
+        .get_activities(Some("2026-11-01"), None, None, None)
+        .await;
+    assert!(matches!(
+        partial,
+        Err(intervals_icu_client::IntervalsError::InvalidInput(_))
+    ));
+
+    let reversed = client
+        .get_events_filtered(None, None, Some("2026-11-30"), Some("2026-11-01"), None)
+        .await;
+    assert!(matches!(
+        reversed,
+        Err(intervals_icu_client::IntervalsError::InvalidInput(_))
+    ));
+}

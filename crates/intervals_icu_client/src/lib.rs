@@ -190,14 +190,50 @@ pub trait IntervalsClient: Send + Sync + 'static {
         limit: Option<u32>,
         days_back: Option<i32>,
     ) -> Result<Vec<ActivitySummary>, IntervalsError>;
+    /// Get full activity rows for an optional inclusive local-date range.
+    ///
+    /// `from` and `to` must either both be supplied (as `YYYY-MM-DD`) or both
+    /// be omitted. Implementations should apply `sport` to the activity `type`
+    /// field case-insensitively and apply `limit` after that filter.
+    async fn get_activities(
+        &self,
+        _from: Option<&str>,
+        _to: Option<&str>,
+        _sport: Option<&str>,
+        _limit: Option<u32>,
+    ) -> Result<serde_json::Value, IntervalsError> {
+        Err(IntervalsError::InvalidInput(
+            "full activity range queries are not implemented by this client".into(),
+        ))
+    }
     async fn create_event(&self, event: Event) -> Result<Event, IntervalsError>;
     async fn get_event(&self, event_id: &str) -> Result<Event, IntervalsError>;
+    async fn get_event_details(&self, event_id: &str) -> Result<serde_json::Value, IntervalsError> {
+        serde_json::to_value(self.get_event(event_id).await?).map_err(IntervalsError::JsonDecode)
+    }
     async fn delete_event(&self, event_id: &str) -> Result<(), IntervalsError>;
     async fn get_events(
         &self,
         days_back: Option<i32>,
         limit: Option<u32>,
     ) -> Result<Vec<Event>, IntervalsError>;
+    /// Get event rows while preserving fields not represented by [`Event`].
+    async fn get_events_filtered(
+        &self,
+        days_back: Option<i32>,
+        limit: Option<u32>,
+        from: Option<&str>,
+        to: Option<&str>,
+        sport: Option<&str>,
+    ) -> Result<serde_json::Value, IntervalsError> {
+        if from.is_some() || to.is_some() || sport.is_some() {
+            return Err(IntervalsError::InvalidInput(
+                "event range and sport filters are not implemented by this client".into(),
+            ));
+        }
+        serde_json::to_value(self.get_events(days_back, limit).await?)
+            .map_err(IntervalsError::JsonDecode)
+    }
     async fn bulk_create_events(&self, events: Vec<Event>) -> Result<Vec<Event>, IntervalsError>;
     async fn get_activity_streams(
         &self,
